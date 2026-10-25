@@ -58,9 +58,10 @@
             <Button android:id="@+id/btnSideload" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Sideload zip…" />
 
             <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Download Mode (Odin)" android:textStyle="bold" />
-            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Boot the target into Download Mode, plug it in, then pick an AP-style .tar or .tar.md5 (e.g. TWRP + vbmeta)." />
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Boot the target into Download Mode and plug it in. Pick .tar / .tar.md5 files for the slots you need (TWRP + vbmeta goes in AP)." />
+            <LinearLayout android:id="@+id/slots" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" />
             <CheckBox android:id="@+id/chkReboot" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Reboot after flash" />
-            <Button android:id="@+id/btnOdinFlash" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Flash .tar…" />
+            <Button android:id="@+id/btnOdinFlash" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Flash selected files" />
         </LinearLayout>
     </ScrollView>
 

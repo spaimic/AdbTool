@@ -15,9 +15,11 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.view.Gravity
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -48,7 +50,9 @@ class MainActivity : ComponentActivity() {
     @Volatile private var conn: AdbConnection? = null
     private var pullRemote = ""
     private lateinit var chkReboot: CheckBox
-    private var pendingFlash: Pair<Uri, List<TarEntry>>? = null
+    private var pendingFlash: List<FlashItem>? = null
+    private val slots = listOf(Slot("BL"), Slot("AP"), Slot("CP"), Slot("CSC"), Slot("USERDATA"))
+    private var pickingSlot: Slot? = null
     private var waitingOdinPermission = false
 
     private val pushPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -58,7 +62,8 @@ class MainActivity : ComponentActivity() {
         if (uri != null) doSideload(uri)
     }
     private val tarPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) prepareTar(uri)
+        val slot = pickingSlot
+        if (uri != null && slot != null) loadSlot(slot, uri)
     }
     private val pullPicker = registerForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -115,7 +120,8 @@ class MainActivity : ComponentActivity() {
         findViewById<Button>(R.id.btnRecovery).setOnClickListener { doReboot("recovery") }
         findViewById<Button>(R.id.btnBootloader).setOnClickListener { doReboot("bootloader") }
         findViewById<Button>(R.id.btnPush).setOnClickListener { pushPicker.launch(arrayOf("*/*")) }
-        findViewById<Button>(R.id.btnOdinFlash).setOnClickListener { tarPicker.launch(arrayOf("*/*")) }
+        buildSlotRows()
+        findViewById<Button>(R.id.btnOdinFlash).setOnClickListener { confirmFlash() }
         findViewById<Button>(R.id.btnSideload).setOnClickListener { sideloadPicker.launch(arrayOf("*/*")) }
         findViewById<Button>(R.id.btnPull).setOnClickListener {
             val r = remotePath.text.toString().trim()
@@ -321,6 +327,38 @@ class MainActivity : ComponentActivity() {
 
     // ------------------------------------------------------------ Download Mode (Odin)
 
+    private fun buildSlotRows() {
+        val box = findViewById<LinearLayout>(R.id.slots)
+        val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
+        for (slot in slots) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            val pick = Button(this)
+            pick.text = slot.label
+            val label = TextView(this)
+            label.text = "—"
+            label.setPadding(16, 0, 16, 0)
+            val clear = Button(this)
+            clear.text = "✕"
+            pick.setOnClickListener {
+                pickingSlot = slot
+                tarPicker.launch(arrayOf("*/*"))
+            }
+            clear.setOnClickListener {
+                slot.uri = null
+                slot.name = ""
+                slot.entries = emptyList()
+                label.text = "—"
+            }
+            slot.nameView = label
+            row.addView(pick, LinearLayout.LayoutParams(0, wrap, 1.2f))
+            row.addView(label, LinearLayout.LayoutParams(0, wrap, 2.5f))
+            row.addView(clear, LinearLayout.LayoutParams(0, wrap, 0.7f))
+            box.addView(row)
+        }
+    }
+
     private fun bulkEndpoints(i: UsbInterface): Pair<UsbEndpoint, UsbEndpoint>? {
         var inEp: UsbEndpoint? = null
         var outEp: UsbEndpoint? = null
@@ -343,7 +381,7 @@ class MainActivity : ComponentActivity() {
         return null
     }
 
-    private fun prepareTar(uri: Uri) {
+    private fun loadSlot(slot: Slot, uri: Uri) {
         if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
         val name = displayName(uri)
         exec.execute {
@@ -352,10 +390,10 @@ class MainActivity : ComponentActivity() {
                 pfd.use { p ->
                     FileInputStream(p.fileDescriptor).channel.use { ch ->
                         if (name.endsWith(".md5", ignoreCase = true)) {
-                            log("Verifying MD5…")
+                            log("Verifying MD5 of $name…")
                             when (TarUtil.verifyMd5(ch)) {
                                 true -> log("✓ MD5 OK")
-                                false -> throw IOException("MD5 mismatch – the file is corrupt, not flashing")
+                                false -> throw IOException("MD5 mismatch – the file is corrupt")
                                 null -> log("No MD5 line found, skipping check")
                             }
                         }
@@ -363,34 +401,41 @@ class MainActivity : ComponentActivity() {
                         if (entries.isEmpty()) throw IOException("No files found in the tar")
                         val lz4 = entries.firstOrNull { it.name.endsWith(".lz4", ignoreCase = true) }
                         if (lz4 != null) throw IOException("${lz4.name}: LZ4-compressed images are not supported yet")
-                        ui { confirmFlash(uri, name, entries) }
+                        slot.uri = uri
+                        slot.name = name
+                        slot.entries = entries
+                        ui { slot.nameView?.text = "$name (${entries.size} files)" }
                     }
                 }
             } catch (e: Exception) {
-                log("✗ ${e.message}")
+                log("✗ ${slot.label}: ${e.message}")
             } finally {
                 busy.set(false)
             }
         }
     }
 
-    private fun confirmFlash(uri: Uri, name: String, entries: List<TarEntry>) {
-        val list = entries.joinToString("\n") { "• ${it.name} (${it.size / 1024} KB)" }
+    private fun confirmFlash() {
+        val items = slots.filter { it.uri != null }.map { FlashItem(it.label, it.uri!!, it.name, it.entries) }
+        if (items.isEmpty()) { log("Select at least one file first"); return }
+        val msg = items.joinToString("\n\n") { item ->
+            "${item.slot}: ${item.name}\n" + item.entries.joinToString("\n") { "  • ${it.name} (${it.size / 1024} KB)" }
+        }
         AlertDialog.Builder(this)
             .setTitle("Flash in Download Mode?")
-            .setMessage("$name\n\n$list\n\nThe target must already be in Download Mode. A wrong image can brick it.")
-            .setPositiveButton("Flash") { _, _ -> startOdin(uri, entries) }
+            .setMessage("$msg\n\nThe target must already be in Download Mode. A wrong image can brick it.")
+            .setPositiveButton("Flash") { _, _ -> startOdin(items) }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun startOdin(uri: Uri, entries: List<TarEntry>) {
+    private fun startOdin(items: List<FlashItem>) {
         val dev = usbManager.deviceList.values.firstOrNull { odinInterface(it) != null }
         if (dev == null) {
             log("No Download Mode device found. Boot the target into Download Mode and connect it via OTG.")
             return
         }
-        pendingFlash = Pair(uri, entries)
+        pendingFlash = items
         if (usbManager.hasPermission(dev)) {
             odinFlash(dev)
         } else {
@@ -400,10 +445,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun odinFlash(dev: UsbDevice) {
-        val job = pendingFlash ?: return
+        val items = pendingFlash ?: return
         pendingFlash = null
-        val uri = job.first
-        val entries = job.second
         if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
         val reboot = chkReboot.isChecked
         exec.execute {
@@ -411,51 +454,70 @@ class MainActivity : ComponentActivity() {
             try {
                 val iface = odinInterface(dev) ?: throw IOException("No Odin interface")
                 val eps = bulkEndpoints(iface) ?: throw IOException("Odin bulk endpoints not found")
+                var ctrl: UsbInterface? = null
+                for (n in 0 until dev.interfaceCount) {
+                    val i = dev.getInterface(n)
+                    if (i.interfaceClass == UsbConstants.USB_CLASS_COMM) { ctrl = i; break }
+                }
+                log("Data interface #${iface.id}: IN 0x${Integer.toHexString(eps.first.address)}, " +
+                    "OUT 0x${Integer.toHexString(eps.second.address)}, max packet ${eps.first.maxPacketSize}")
+
                 val usb = usbManager.openDevice(dev) ?: throw IOException("openDevice failed")
+                if (ctrl != null) usb.claimInterface(ctrl, true)
                 if (!usb.claimInterface(iface, true)) { usb.close(); throw IOException("claimInterface failed") }
                 usb.setInterface(iface)
-                val o = OdinConnection(usb, iface, eps.first, eps.second)
+                val o = OdinConnection(usb, iface, ctrl, eps.first, eps.second)
                 odin = o
                 o.log = { log(it) }
 
                 setStatus("Download Mode: flashing…")
+                log("Setting up serial lines…")
+                o.setupSerial()
+                log("Handshake…")
                 o.handshake()
+                log("LOKE received. Starting session…")
                 val dflt = o.beginSession()
-                log("Odin session open (0x${Integer.toHexString(dflt)})")
+                log("Session open (0x${Integer.toHexString(dflt)}). Reading PIT…")
                 val pit = OdinConnection.parsePit(o.downloadPit())
                 log("PIT: ${pit.size} partitions")
 
                 // Map every file to a partition BEFORE writing anything.
-                val plan = ArrayList<Pair<TarEntry, PitEntry>>()
-                for (e in entries) {
-                    val base = e.name.substringAfterLast('/')
-                    val p = pit.firstOrNull { it.flashName.equals(base, ignoreCase = true) }
-                        ?: pit.firstOrNull { it.name.equals(base.substringBeforeLast('.'), ignoreCase = true) }
-                        ?: throw IOException("${e.name}: no matching partition in the device PIT – nothing was flashed")
-                    if (p.binaryType != 0) {
-                        throw IOException("${e.name} maps to ${p.name}, which is not an AP partition – refusing")
+                val plan = ArrayList<PlanStep>()
+                for (item in items) {
+                    for (e in item.entries) {
+                        val base = e.name.substringAfterLast('/')
+                        val p = pit.firstOrNull { it.flashName.equals(base, ignoreCase = true) }
+                            ?: pit.firstOrNull { it.name.equals(base.substringBeforeLast('.'), ignoreCase = true) }
+                            ?: throw IOException("${e.name}: no matching partition in the device PIT – nothing was flashed")
+                        val wantModem = item.slot == "CP"
+                        if ((p.binaryType == 1) != wantModem) {
+                            throw IOException(
+                                "${e.name} maps to ${p.name}, which is a ${if (p.binaryType == 1) "modem (CP)" else "non-modem"} " +
+                                    "partition, but it is in the ${item.slot} slot – nothing was flashed"
+                            )
+                        }
+                        plan.add(PlanStep(item, e, p))
+                        log("${item.slot}: ${e.name} → ${p.name}")
                     }
-                    plan.add(Pair(e, p))
-                    log("${e.name} → ${p.name}")
                 }
 
-                val total = entries.fold(0L) { a, e -> a + e.size }
+                val total = plan.fold(0L) { a, st -> a + st.entry.size }
                 o.totalBytes(total)
 
-                val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("Cannot open file")
-                pfd.use { pf ->
-                    FileInputStream(pf.fileDescriptor).channel.use { ch ->
-                        var done = 0L
-                        for (step in plan) {
-                            val e = step.first
-                            val p = step.second
-                            log("Flashing ${e.name}…")
-                            val base = done
-                            o.flash(ch, e.dataOffset, e.size, p) { sent ->
-                                showProgress(((base + sent) * 100 / total).toInt())
+                var done = 0L
+                for (item in items) {
+                    val pfd = contentResolver.openFileDescriptor(item.uri, "r") ?: throw IOException("Cannot open file")
+                    pfd.use { pf ->
+                        FileInputStream(pf.fileDescriptor).channel.use { ch ->
+                            for (st in plan.filter { it.item === item }) {
+                                log("Flashing ${st.entry.name}…")
+                                val base = done
+                                o.flash(ch, st.entry.dataOffset, st.entry.size, st.part, st.part.binaryType == 1) { sent ->
+                                    showProgress(((base + sent) * 100 / total).toInt())
+                                }
+                                done += st.entry.size
+                                log("✓ ${st.part.name}")
                             }
-                            done += e.size
-                            log("✓ ${p.name}")
                         }
                     }
                 }
@@ -478,3 +540,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+class Slot(val label: String) {
+    var uri: Uri? = null
+    var name: String = ""
+    var entries: List<TarEntry> = emptyList()
+    var nameView: TextView? = null
+}
+
+class FlashItem(val slot: String, val uri: Uri, val name: String, val entries: List<TarEntry>)
+
+class PlanStep(val item: FlashItem, val entry: TarEntry, val part: PitEntry)

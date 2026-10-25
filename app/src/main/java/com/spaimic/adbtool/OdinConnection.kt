@@ -22,10 +22,12 @@ class PitEntry(
 class OdinConnection(
     private val usb: UsbDeviceConnection,
     private val iface: UsbInterface,
+    private val ctrl: UsbInterface?,
     private val epIn: UsbEndpoint,
     private val epOut: UsbEndpoint
 ) {
     private class Resp(val type: Int, val data: Int)
+    private class OdinTimeout(msg: String) : IOException(msg)
 
     var log: (String) -> Unit = {}
 
@@ -58,7 +60,7 @@ class OdinConnection(
                 fast++
                 if (fast > 20) throw IOException("USB read failed (device gone?)")
             }
-            if (SystemClock.elapsedRealtime() > deadline) throw IOException("Timed out waiting for the device")
+            if (SystemClock.elapsedRealtime() > deadline) throw OdinTimeout("Timed out waiting for the device")
         }
     }
 
@@ -86,17 +88,42 @@ class OdinConnection(
         if (closed) return
         closed = true
         try { usb.releaseInterface(iface) } catch (_: Exception) {}
+        try { if (ctrl != null) usb.releaseInterface(ctrl) } catch (_: Exception) {}
         try { usb.close() } catch (_: Exception) {}
     }
 
     // ------------------------------------------------------------ session
 
-    fun handshake() {
-        send("ODIN".toByteArray())
-        val d = recv(5000)
-        if (d.size < 4 || String(d, 0, 4) != "LOKE") {
-            throw IOException("Device did not answer LOKE – is it in Download Mode?")
+    /** CDC-ACM setup: 115200 8N1 line coding, then raise DTR+RTS (what a PC COM-port driver does on open). */
+    fun setupSerial() {
+        if (ctrl == null) { log("  (no CDC control interface found)"); return }
+        val lc = byteArrayOf(0x00, 0xC2.toByte(), 0x01, 0x00, 0x00, 0x00, 0x08)
+        val r1 = usb.controlTransfer(0x21, 0x20, 0, ctrl.id, lc, lc.size, 1000)
+        val r2 = usb.controlTransfer(0x21, 0x22, 0x03, ctrl.id, null, 0, 1000)
+        log("  line coding: $r1, DTR/RTS: $r2")
+    }
+
+    private fun drain() {
+        for (i in 0 until 5) {
+            if (usb.bulkTransfer(epIn, rbuf, rbuf.size, 150) <= 0) break
         }
+    }
+
+    private fun hex(d: ByteArray) = d.take(16).joinToString(" ") { "%02x".format(it) }
+
+    fun handshake() {
+        drain()
+        for (attempt in 1..3) {
+            send("ODIN".toByteArray())
+            try {
+                val d = recv(4000)
+                if (d.size >= 4 && String(d, 0, 4) == "LOKE") return
+                log("  unexpected reply: ${hex(d)}")
+            } catch (e: OdinTimeout) {
+                log("  no answer to ODIN (attempt $attempt/3)")
+            }
+        }
+        throw IOException("Device never answered LOKE after 3 tries")
     }
 
     /** Returns the device's reported default-packet-size field (0 = old protocol). */
@@ -135,7 +162,7 @@ class OdinConnection(
     }
 
     /** Flashes one file (a region of [ch]) to the partition described by [e]. */
-    fun flash(ch: FileChannel, dataOffset: Long, size: Long, e: PitEntry, progress: (Long) -> Unit) {
+    fun flash(ch: FileChannel, dataOffset: Long, size: Long, e: PitEntry, modem: Boolean, progress: (Long) -> Unit) {
         send(pkt(0x66, 0))
         resp(0x66)
 
@@ -169,7 +196,9 @@ class OdinConnection(
                 progress(sent)
             }
 
-            send(pkt(0x66, 3, 0, effective.toInt(), 0, e.deviceType, e.id, if (isLast) 1 else 0))
+            val last = if (isLast) 1 else 0
+            if (modem) send(pkt(0x66, 3, 1, effective.toInt(), 0, e.deviceType, last))
+            else send(pkt(0x66, 3, 0, effective.toInt(), 0, e.deviceType, e.id, last))
             val r = resp(0x66, 300000)
             log("  device status: ${r.data}")
         }
