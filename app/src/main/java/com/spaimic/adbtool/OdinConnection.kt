@@ -39,6 +39,7 @@ class OdinConnection(
     // ------------------------------------------------------------ USB layer
 
     private fun send(b: ByteArray) {
+        if (b.size == 1024) log("  → ${hex(b)}")
         var o = 0
         while (o < b.size) {
             if (closed) throw IOException("Disconnected")
@@ -48,14 +49,18 @@ class OdinConnection(
         }
     }
 
-    private fun recv(timeoutMs: Long = 30000): ByteArray {
+    private fun recv(timeoutMs: Long = 15000): ByteArray {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         var fast = 0
         while (true) {
             if (closed) throw IOException("Disconnected")
             val t0 = SystemClock.elapsedRealtime()
             val r = usb.bulkTransfer(epIn, rbuf, rbuf.size, 1000)
-            if (r > 0) return rbuf.copyOf(r)
+            if (r > 0) {
+                val d = rbuf.copyOf(r)
+                log("  ← ${d.size}B ${hex(d)}")
+                return d
+            }
             if (r < 0 && SystemClock.elapsedRealtime() - t0 < 500) {
                 fast++
                 if (fast > 20) throw IOException("USB read failed (device gone?)")
@@ -71,7 +76,7 @@ class OdinConnection(
         return b.array()
     }
 
-    private fun resp(expect: Int, timeoutMs: Long = 30000): Resp {
+    private fun resp(expect: Int, timeoutMs: Long = 15000): Resp {
         val d = recv(timeoutMs)
         if (d.size < 8) throw IOException("Short response (${d.size} bytes)")
         val bb = ByteBuffer.wrap(d).order(ByteOrder.LITTLE_ENDIAN)
@@ -109,7 +114,7 @@ class OdinConnection(
         }
     }
 
-    private fun hex(d: ByteArray) = d.take(16).joinToString(" ") { "%02x".format(it) }
+    private fun hex(d: ByteArray) = d.take(12).joinToString(" ") { "%02x".format(it) }
 
     fun handshake() {
         drain()
@@ -140,8 +145,22 @@ class OdinConnection(
     }
 
     fun downloadPit(): ByteArray {
-        send(pkt(0x65, 1))
-        val size = resp(0x65).data
+        var size = -1
+        for (attempt in 1..3) {
+            if (attempt == 3) {
+                log("  asking for device info first")
+                try { send(pkt(0x64, 1)); recv(4000) } catch (e: OdinTimeout) { log("  no device-info reply") }
+            }
+            send(pkt(0x65, 1))
+            try {
+                size = resp(0x65, 8000).data
+                break
+            } catch (e: OdinTimeout) {
+                log("  no PIT size reply (attempt $attempt/3)")
+            }
+        }
+        if (size < 0) throw IOException("Device does not answer the PIT request")
+        log("  PIT size: $size bytes")
         if (size <= 0 || size > 1_000_000) throw IOException("Bad PIT size: $size")
         val out = ByteArray(size)
         val parts = (size + 499) / 500
@@ -204,9 +223,9 @@ class OdinConnection(
         }
     }
 
-    fun endSession() {
+    fun endSession(timeoutMs: Long = 15000) {
         send(pkt(0x67, 0))
-        resp(0x67)
+        resp(0x67, timeoutMs)
     }
 
     fun reboot() {

@@ -531,6 +531,7 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 log("✗ Download Mode flash failed: ${e.message}")
+                try { odin?.endSession(2000) } catch (_: Exception) {}
             } finally {
                 odin?.close()
                 busy.set(false)
