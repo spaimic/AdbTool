@@ -132,7 +132,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setStatus(s: String) = ui { status.text = s }
-    private fun setProgress(p: Int) = ui { progress.progress = p }
+    private fun showProgress(p: Int) = ui { progress.progress = p }
 
     @Suppress("DEPRECATION")
     private fun deviceFrom(i: Intent): UsbDevice? =
@@ -154,7 +154,7 @@ class MainActivity : ComponentActivity() {
                 log("✗ $name failed: ${e.message}")
             } finally {
                 busy.set(false)
-                setProgress(0)
+                showProgress(0)
             }
         }
     }
@@ -264,7 +264,7 @@ class MainActivity : ComponentActivity() {
                 val size = p.statSize
                 log("Pushing $name → $remote ($size bytes)")
                 FileInputStream(p.fileDescriptor).use { ins ->
-                    c.push(ins, remote) { done -> if (size > 0) setProgress((done * 100 / size).toInt()) }
+                    c.push(ins, remote) { done -> if (size > 0) showProgress((done * 100 / size).toInt()) }
                 }
             }
             log("✓ Push complete")
@@ -290,7 +290,7 @@ class MainActivity : ComponentActivity() {
                 if (size <= 0) throw IOException("Cannot determine file size")
                 log("Sideloading $name ($size bytes)…")
                 FileInputStream(p.fileDescriptor).channel.use { ch ->
-                    val done = c.sideload(ch, size) { sent, total -> setProgress((sent * 100 / total).toInt()) }
+                    val done = c.sideload(ch, size) { sent, total -> showProgress((sent * 100 / total).toInt()) }
                     log(if (done) "✓ Sideload finished" else "Stream closed by device – check its screen")
                 }
             }
