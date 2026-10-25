@@ -56,6 +56,11 @@
             <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Sideload" android:textStyle="bold" />
             <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="In recovery pick “Apply update from ADB”, then Connect." />
             <Button android:id="@+id/btnSideload" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Sideload zip…" />
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Download Mode (Odin)" android:textStyle="bold" />
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Boot the target into Download Mode, plug it in, then pick an AP-style .tar or .tar.md5 (e.g. TWRP + vbmeta)." />
+            <CheckBox android:id="@+id/chkReboot" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Reboot after flash" />
+            <Button android:id="@+id/btnOdinFlash" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Flash .tar…" />
         </LinearLayout>
     </ScrollView>
 

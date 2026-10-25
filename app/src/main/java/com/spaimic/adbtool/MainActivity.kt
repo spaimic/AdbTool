@@ -1,5 +1,6 @@
 package com.spaimic.adbtool
 
+import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -7,12 +8,15 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbEndpoint
+import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -43,12 +47,18 @@ class MainActivity : ComponentActivity() {
     private val busy = AtomicBoolean(false)
     @Volatile private var conn: AdbConnection? = null
     private var pullRemote = ""
+    private lateinit var chkReboot: CheckBox
+    private var pendingFlash: Pair<Uri, List<TarEntry>>? = null
+    private var waitingOdinPermission = false
 
     private val pushPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) doPush(uri)
     }
     private val sideloadPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) doSideload(uri)
+    }
+    private val tarPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) prepareTar(uri)
     }
     private val pullPicker = registerForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -59,8 +69,14 @@ class MainActivity : ComponentActivity() {
             when (i.action) {
                 ACTION_PERMISSION -> {
                     val dev = deviceFrom(i)
-                    if (dev != null && i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) connect(dev)
-                    else log("USB permission denied")
+                    val granted = i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    val odin = waitingOdinPermission
+                    waitingOdinPermission = false
+                    if (dev == null || !granted) {
+                        pendingFlash = null
+                        log("USB permission denied")
+                    } else if (odin) odinFlash(dev)
+                    else connect(dev)
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     if (conn != null) {
@@ -84,6 +100,7 @@ class MainActivity : ComponentActivity() {
         progress = findViewById(R.id.progress)
         cmdInput = findViewById(R.id.cmdInput)
         remotePath = findViewById(R.id.remotePath)
+        chkReboot = findViewById(R.id.chkReboot)
 
         val filter = IntentFilter().apply {
             addAction(ACTION_PERMISSION)
@@ -98,6 +115,7 @@ class MainActivity : ComponentActivity() {
         findViewById<Button>(R.id.btnRecovery).setOnClickListener { doReboot("recovery") }
         findViewById<Button>(R.id.btnBootloader).setOnClickListener { doReboot("bootloader") }
         findViewById<Button>(R.id.btnPush).setOnClickListener { pushPicker.launch(arrayOf("*/*")) }
+        findViewById<Button>(R.id.btnOdinFlash).setOnClickListener { tarPicker.launch(arrayOf("*/*")) }
         findViewById<Button>(R.id.btnSideload).setOnClickListener { sideloadPicker.launch(arrayOf("*/*")) }
         findViewById<Button>(R.id.btnPull).setOnClickListener {
             val r = remotePath.text.toString().trim()
@@ -178,11 +196,15 @@ class MainActivity : ComponentActivity() {
         if (usbManager.hasPermission(dev)) {
             connect(dev)
         } else {
-            val flags = PendingIntent.FLAG_UPDATE_CURRENT or
-                if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
-            val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERMISSION).setPackage(packageName), flags)
-            usbManager.requestPermission(dev, pi)
+            requestUsbPermission(dev)
         }
+    }
+
+    private fun requestUsbPermission(dev: UsbDevice) {
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+        val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERMISSION).setPackage(packageName), flags)
+        usbManager.requestPermission(dev, pi)
     }
 
     private fun connect(dev: UsbDevice) {
@@ -293,6 +315,165 @@ class MainActivity : ComponentActivity() {
                     val done = c.sideload(ch, size) { sent, total -> showProgress((sent * 100 / total).toInt()) }
                     log(if (done) "✓ Sideload finished" else "Stream closed by device – check its screen")
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ Download Mode (Odin)
+
+    private fun bulkEndpoints(i: UsbInterface): Pair<UsbEndpoint, UsbEndpoint>? {
+        var inEp: UsbEndpoint? = null
+        var outEp: UsbEndpoint? = null
+        for (n in 0 until i.endpointCount) {
+            val e = i.getEndpoint(n)
+            if (e.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                if (e.direction == UsbConstants.USB_DIR_IN) inEp = e else outEp = e
+            }
+        }
+        return if (inEp != null && outEp != null) Pair(inEp, outEp) else null
+    }
+
+    /** Samsung Download Mode exposes a CDC-data interface with two bulk endpoints. */
+    private fun odinInterface(d: UsbDevice): UsbInterface? {
+        if (d.vendorId != 0x04E8) return null
+        for (n in 0 until d.interfaceCount) {
+            val i = d.getInterface(n)
+            if (i.interfaceClass == UsbConstants.USB_CLASS_CDC_DATA && bulkEndpoints(i) != null) return i
+        }
+        return null
+    }
+
+    private fun prepareTar(uri: Uri) {
+        if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
+        val name = displayName(uri)
+        exec.execute {
+            try {
+                val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("Cannot open file")
+                pfd.use { p ->
+                    FileInputStream(p.fileDescriptor).channel.use { ch ->
+                        if (name.endsWith(".md5", ignoreCase = true)) {
+                            log("Verifying MD5…")
+                            when (TarUtil.verifyMd5(ch)) {
+                                true -> log("✓ MD5 OK")
+                                false -> throw IOException("MD5 mismatch – the file is corrupt, not flashing")
+                                null -> log("No MD5 line found, skipping check")
+                            }
+                        }
+                        val entries = TarUtil.list(ch)
+                        if (entries.isEmpty()) throw IOException("No files found in the tar")
+                        val lz4 = entries.firstOrNull { it.name.endsWith(".lz4", ignoreCase = true) }
+                        if (lz4 != null) throw IOException("${lz4.name}: LZ4-compressed images are not supported yet")
+                        ui { confirmFlash(uri, name, entries) }
+                    }
+                }
+            } catch (e: Exception) {
+                log("✗ ${e.message}")
+            } finally {
+                busy.set(false)
+            }
+        }
+    }
+
+    private fun confirmFlash(uri: Uri, name: String, entries: List<TarEntry>) {
+        val list = entries.joinToString("\n") { "• ${it.name} (${it.size / 1024} KB)" }
+        AlertDialog.Builder(this)
+            .setTitle("Flash in Download Mode?")
+            .setMessage("$name\n\n$list\n\nThe target must already be in Download Mode. A wrong image can brick it.")
+            .setPositiveButton("Flash") { _, _ -> startOdin(uri, entries) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun startOdin(uri: Uri, entries: List<TarEntry>) {
+        val dev = usbManager.deviceList.values.firstOrNull { odinInterface(it) != null }
+        if (dev == null) {
+            log("No Download Mode device found. Boot the target into Download Mode and connect it via OTG.")
+            return
+        }
+        pendingFlash = Pair(uri, entries)
+        if (usbManager.hasPermission(dev)) {
+            odinFlash(dev)
+        } else {
+            waitingOdinPermission = true
+            requestUsbPermission(dev)
+        }
+    }
+
+    private fun odinFlash(dev: UsbDevice) {
+        val job = pendingFlash ?: return
+        pendingFlash = null
+        val uri = job.first
+        val entries = job.second
+        if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
+        val reboot = chkReboot.isChecked
+        exec.execute {
+            var odin: OdinConnection? = null
+            try {
+                val iface = odinInterface(dev) ?: throw IOException("No Odin interface")
+                val eps = bulkEndpoints(iface) ?: throw IOException("Odin bulk endpoints not found")
+                val usb = usbManager.openDevice(dev) ?: throw IOException("openDevice failed")
+                if (!usb.claimInterface(iface, true)) { usb.close(); throw IOException("claimInterface failed") }
+                usb.setInterface(iface)
+                val o = OdinConnection(usb, iface, eps.first, eps.second)
+                odin = o
+                o.log = { log(it) }
+
+                setStatus("Download Mode: flashing…")
+                o.handshake()
+                val dflt = o.beginSession()
+                log("Odin session open (0x${Integer.toHexString(dflt)})")
+                val pit = OdinConnection.parsePit(o.downloadPit())
+                log("PIT: ${pit.size} partitions")
+
+                // Map every file to a partition BEFORE writing anything.
+                val plan = ArrayList<Pair<TarEntry, PitEntry>>()
+                for (e in entries) {
+                    val base = e.name.substringAfterLast('/')
+                    val p = pit.firstOrNull { it.flashName.equals(base, ignoreCase = true) }
+                        ?: pit.firstOrNull { it.name.equals(base.substringBeforeLast('.'), ignoreCase = true) }
+                        ?: throw IOException("${e.name}: no matching partition in the device PIT – nothing was flashed")
+                    if (p.binaryType != 0) {
+                        throw IOException("${e.name} maps to ${p.name}, which is not an AP partition – refusing")
+                    }
+                    plan.add(Pair(e, p))
+                    log("${e.name} → ${p.name}")
+                }
+
+                val total = entries.fold(0L) { a, e -> a + e.size }
+                o.totalBytes(total)
+
+                val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("Cannot open file")
+                pfd.use { pf ->
+                    FileInputStream(pf.fileDescriptor).channel.use { ch ->
+                        var done = 0L
+                        for (step in plan) {
+                            val e = step.first
+                            val p = step.second
+                            log("Flashing ${e.name}…")
+                            val base = done
+                            o.flash(ch, e.dataOffset, e.size, p) { sent ->
+                                showProgress(((base + sent) * 100 / total).toInt())
+                            }
+                            done += e.size
+                            log("✓ ${p.name}")
+                        }
+                    }
+                }
+
+                o.endSession()
+                if (reboot) {
+                    o.reboot()
+                    log("✓ Flash complete – rebooting")
+                } else {
+                    log("✓ Flash complete – device is still in Download Mode")
+                }
+            } catch (e: Exception) {
+                log("✗ Download Mode flash failed: ${e.message}")
+            } finally {
+                odin?.close()
+                busy.set(false)
+                showProgress(0)
+                if (conn == null) setStatus("Not connected")
             }
         }
     }
