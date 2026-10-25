@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:id="@+id/status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Not connected"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/btnConnect" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Connect" />
+                <Button android:id="@+id/btnDisconnect" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Disconnect" />
+            </LinearLayout>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Shell command" android:textStyle="bold" />
+            <EditText android:id="@+id/cmdInput" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="getprop ro.product.model" android:inputType="text" android:singleLine="true" />
+            <Button android:id="@+id/btnRun" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Run" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/btnReboot" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Reboot" />
+                <Button android:id="@+id/btnRecovery" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Recovery" />
+                <Button android:id="@+id/btnBootloader" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Download" />
+            </LinearLayout>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="File transfer" android:textStyle="bold" />
+            <EditText android:id="@+id/remotePath" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="Remote path" android:inputType="text" android:singleLine="true" android:text="/sdcard/" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/btnPush" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Push file…" />
+                <Button android:id="@+id/btnPull" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Pull file…" />
+            </LinearLayout>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Sideload" android:textStyle="bold" />
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="In recovery pick “Apply update from ADB”, then Connect." />
+            <Button android:id="@+id/btnSideload" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Sideload zip…" />
+        </LinearLayout>
+    </ScrollView>
+
+    <ProgressBar
+        android:id="@+id/progress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="100" />
+
+    <ScrollView
+        android:id="@+id/logScroll"
+        android:layout_width="match_parent"
+        android:layout_height="220dp"
+        android:background="#EEEEEE">
+        <TextView
+            android:id="@+id/log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+    </ScrollView>
+</LinearLayout>
