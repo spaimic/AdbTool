@@ -36,10 +36,14 @@ class OdinConnection(
     private var seqMax = 800
     private val rbuf = ByteArray(2048)
 
+    /** How control packets must be framed for this device: 0 = plain, 1 = + empty transfer, 2 = + 1024 padding bytes. */
+    private var ctlMode = 0
+    private var zlpData = false
+
     // ------------------------------------------------------------ USB layer
 
     private fun send(b: ByteArray) {
-        if (b.size == 1024) log("  → ${hex(b)}")
+        if (b.size <= 2048) log("  → ${hex(b)}${if (b.size != 1024) " (${b.size}B)" else ""}")
         var o = 0
         while (o < b.size) {
             if (closed) throw IOException("Disconnected")
@@ -49,25 +53,41 @@ class OdinConnection(
         }
     }
 
+    /** Zero-length bulk transfer (terminates a transfer that ended on a packet boundary). */
+    private fun zlp() {
+        log("  → (empty transfer)")
+        try { usb.bulkTransfer(epOut, ByteArray(1), 0, 1000) } catch (_: Exception) {}
+    }
+
     private fun recv(timeoutMs: Long = 15000): ByteArray {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         var fast = 0
         while (true) {
             if (closed) throw IOException("Disconnected")
             val t0 = SystemClock.elapsedRealtime()
-            val r = usb.bulkTransfer(epIn, rbuf, rbuf.size, 1000)
+            val r = usb.bulkTransfer(epIn, rbuf, rbuf.size, 500)
             if (r > 0) {
                 val d = rbuf.copyOf(r)
                 log("  ← ${d.size}B ${hex(d)}")
                 return d
             }
-            if (r < 0 && SystemClock.elapsedRealtime() - t0 < 500) {
+            if (r < 0 && SystemClock.elapsedRealtime() - t0 < 250) {
                 fast++
-                if (fast > 20) throw IOException("USB read failed (device gone?)")
+                if (fast > 40) throw IOException("USB read failed (device gone?)")
             }
             if (SystemClock.elapsedRealtime() > deadline) throw OdinTimeout("Timed out waiting for the device")
         }
     }
+
+    private fun drain() {
+        for (i in 0 until 5) {
+            val r = usb.bulkTransfer(epIn, rbuf, rbuf.size, 60)
+            if (r <= 0) break
+            log("  (discarded ${r}B stale data)")
+        }
+    }
+
+    private fun hex(d: ByteArray) = d.take(12).joinToString(" ") { "%02x".format(it) }
 
     /** Control packets are always 1024 bytes of little-endian ints (type, subtype, data...). */
     private fun pkt(vararg v: Int): ByteArray {
@@ -89,6 +109,33 @@ class OdinConnection(
         return r
     }
 
+    /**
+     * Sends a control packet and reads the answer. If the device stays silent, it retries the framing
+     * variants (empty transfer, padding) and remembers which one made it answer.
+     */
+    private fun <T> ask(req: ByteArray, timeoutMs: Long = 15000, probe: Boolean = true, read: (Long) -> T): T {
+        drain()
+        when (ctlMode) {
+            0 -> send(req)
+            1 -> { send(req); zlp() }
+            else -> send(req + ByteArray(1024))
+        }
+        if (ctlMode == 0 && probe) {
+            try { return read(2500) } catch (_: OdinTimeout) {}
+            for (mode in 1..2) {
+                log("  no reply – trying ${if (mode == 1) "an empty transfer" else "a padded packet"}")
+                if (mode == 1) zlp() else send(ByteArray(1024))
+                try {
+                    val r = read(3000)
+                    ctlMode = mode
+                    log("  (device needs framing mode $mode)")
+                    return r
+                } catch (_: OdinTimeout) {}
+            }
+        }
+        return read(timeoutMs)
+    }
+
     fun close() {
         if (closed) return
         closed = true
@@ -108,14 +155,6 @@ class OdinConnection(
         log("  line coding: $r1, DTR/RTS: $r2")
     }
 
-    private fun drain() {
-        for (i in 0 until 5) {
-            if (usb.bulkTransfer(epIn, rbuf, rbuf.size, 150) <= 0) break
-        }
-    }
-
-    private fun hex(d: ByteArray) = d.take(12).joinToString(" ") { "%02x".format(it) }
-
     fun handshake() {
         drain()
         for (attempt in 1..3) {
@@ -133,11 +172,9 @@ class OdinConnection(
 
     /** Returns the device's reported default-packet-size field (0 = old protocol). */
     fun beginSession(): Int {
-        send(pkt(0x64, 0, 4))
-        val r = resp(0x64)
+        val r = ask(pkt(0x64, 0, 4)) { resp(0x64, it) }
         if (r.data != 0) {
-            send(pkt(0x64, 5, 1048576))
-            resp(0x64)
+            ask(pkt(0x64, 5, 1048576)) { resp(0x64, it) }
             packetSize = 1048576
             seqMax = 30
         }
@@ -145,45 +182,27 @@ class OdinConnection(
     }
 
     fun downloadPit(): ByteArray {
-        var size = -1
-        for (attempt in 1..3) {
-            if (attempt == 3) {
-                log("  asking for device info first")
-                try { send(pkt(0x64, 1)); recv(4000) } catch (e: OdinTimeout) { log("  no device-info reply") }
-            }
-            send(pkt(0x65, 1))
-            try {
-                size = resp(0x65, 8000).data
-                break
-            } catch (e: OdinTimeout) {
-                log("  no PIT size reply (attempt $attempt/3)")
-            }
-        }
-        if (size < 0) throw IOException("Device does not answer the PIT request")
+        val size = ask(pkt(0x65, 1)) { resp(0x65, it) }.data
         log("  PIT size: $size bytes")
         if (size <= 0 || size > 1_000_000) throw IOException("Bad PIT size: $size")
         val out = ByteArray(size)
         val parts = (size + 499) / 500
         for (i in 0 until parts) {
-            send(pkt(0x65, 2, i))
-            val d = recv()
+            val d = ask(pkt(0x65, 2, i)) { recv(it) }
             val n = min(min(d.size, 500), size - i * 500)
             System.arraycopy(d, 0, out, i * 500, n)
         }
-        send(pkt(0x65, 3))
-        resp(0x65)
+        ask(pkt(0x65, 3)) { resp(0x65, it) }
         return out
     }
 
     fun totalBytes(total: Long) {
-        send(pkt(0x64, 2, total.toInt(), (total ushr 32).toInt()))
-        resp(0x64)
+        ask(pkt(0x64, 2, total.toInt(), (total ushr 32).toInt())) { resp(0x64, it) }
     }
 
     /** Flashes one file (a region of [ch]) to the partition described by [e]. */
     fun flash(ch: FileChannel, dataOffset: Long, size: Long, e: PitEntry, modem: Boolean, progress: (Long) -> Unit) {
-        send(pkt(0x66, 0))
-        resp(0x66)
+        ask(pkt(0x66, 0)) { resp(0x66, it) }
 
         val seqBytes = seqMax.toLong() * packetSize
         val seqCount = ((size + seqBytes - 1) / seqBytes).toInt()
@@ -196,8 +215,7 @@ class OdinConnection(
             val effective = if (isLast) size - seqStart else seqBytes
             val packets = ((effective + packetSize - 1) / packetSize).toInt()
 
-            send(pkt(0x66, 2, packets * packetSize))
-            resp(0x66)
+            ask(pkt(0x66, 2, packets * packetSize)) { resp(0x66, it) }
 
             for (p in 0 until packets) {
                 val want = min(packetSize.toLong(), effective - p.toLong() * packetSize).toInt()
@@ -209,28 +227,40 @@ class OdinConnection(
                     pos += n
                 }
                 java.util.Arrays.fill(buf, want, buf.size, 0.toByte())
-                send(buf)
-                resp(0x66)
+                sendPart(buf)
                 sent += want
                 progress(sent)
             }
 
             val last = if (isLast) 1 else 0
-            if (modem) send(pkt(0x66, 3, 1, effective.toInt(), 0, e.deviceType, last))
-            else send(pkt(0x66, 3, 0, effective.toInt(), 0, e.deviceType, e.id, last))
-            val r = resp(0x66, 300000)
+            val endPkt = if (modem) pkt(0x66, 3, 1, effective.toInt(), 0, e.deviceType, last)
+            else pkt(0x66, 3, 0, effective.toInt(), 0, e.deviceType, e.id, last)
+            val r = ask(endPkt, 300000, probe = false) { resp(0x66, it) }
             log("  device status: ${r.data}")
         }
     }
 
+    private fun sendPart(buf: ByteArray) {
+        send(buf)
+        if (zlpData) zlp()
+        try {
+            resp(0x66, if (zlpData) 30000 else 5000)
+        } catch (e: OdinTimeout) {
+            if (zlpData) throw e
+            log("  no part ack – trying an empty transfer")
+            zlp()
+            resp(0x66, 30000)
+            zlpData = true
+            log("  (device needs empty transfers after data packets)")
+        }
+    }
+
     fun endSession(timeoutMs: Long = 15000) {
-        send(pkt(0x67, 0))
-        resp(0x67, timeoutMs)
+        ask(pkt(0x67, 0), timeoutMs, probe = false) { resp(0x67, it) }
     }
 
     fun reboot() {
-        send(pkt(0x67, 1))
-        resp(0x67)
+        ask(pkt(0x67, 1), 15000, probe = false) { resp(0x67, it) }
     }
 
     companion object {

@@ -371,14 +371,30 @@ class MainActivity : ComponentActivity() {
         return if (inEp != null && outEp != null) Pair(inEp, outEp) else null
     }
 
-    /** Samsung Download Mode exposes a CDC-data interface with two bulk endpoints. */
+    /** Samsung Download Mode ("Gadget Serial") exposes a CDC-data interface with two bulk endpoints. */
     private fun odinInterface(d: UsbDevice): UsbInterface? {
         if (d.vendorId != 0x04E8) return null
+        var fallback: UsbInterface? = null
         for (n in 0 until d.interfaceCount) {
             val i = d.getInterface(n)
-            if (i.interfaceClass == UsbConstants.USB_CLASS_CDC_DATA && bulkEndpoints(i) != null) return i
+            if (bulkEndpoints(i) == null) continue
+            if (i.interfaceClass == UsbConstants.USB_CLASS_CDC_DATA) return i
+            val isAdb = i.interfaceClass == 255 && i.interfaceSubclass == 66
+            if (!isAdb && i.interfaceClass != UsbConstants.USB_CLASS_MASS_STORAGE && fallback == null) fallback = i
         }
-        return null
+        return fallback
+    }
+
+    private fun describeUsb(): String {
+        val devs = usbManager.deviceList.values
+        if (devs.isEmpty()) return "no USB devices visible"
+        return devs.joinToString("; ") { d ->
+            "%04x:%04x [".format(d.vendorId, d.productId) +
+                (0 until d.interfaceCount).joinToString(" ") { n ->
+                    val i = d.getInterface(n)
+                    "if${i.id}:class${i.interfaceClass}/${i.endpointCount}ep"
+                } + "]"
+        }
     }
 
     private fun loadSlot(slot: Slot, uri: Uri) {
@@ -433,6 +449,7 @@ class MainActivity : ComponentActivity() {
         val dev = usbManager.deviceList.values.firstOrNull { odinInterface(it) != null }
         if (dev == null) {
             log("No Download Mode device found. Boot the target into Download Mode and connect it via OTG.")
+            log("USB devices seen: ${describeUsb()}")
             return
         }
         pendingFlash = items
