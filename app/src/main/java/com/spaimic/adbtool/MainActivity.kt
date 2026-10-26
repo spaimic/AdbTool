@@ -514,7 +514,7 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         plan.add(PlanStep(item, e, p))
-                        log("${item.slot}: ${e.name} → ${p.name}")
+                        log("${item.slot}: ${e.name} → ${p.name} (id ${p.id}, dev ${p.deviceType})")
                     }
                 }
 

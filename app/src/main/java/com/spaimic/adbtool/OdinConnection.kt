@@ -39,6 +39,7 @@ class OdinConnection(
     /** How control packets must be framed for this device: 0 = plain, 1 = + empty transfer, 2 = + 1024 padding bytes. */
     private var ctlMode = 0
     private var zlpData = false
+    private var warnedIndex = false
 
     // ------------------------------------------------------------ USB layer
 
@@ -227,7 +228,8 @@ class OdinConnection(
                     pos += n
                 }
                 java.util.Arrays.fill(buf, want, buf.size, 0.toByte())
-                sendPart(buf)
+                if (p == 0) log("  data: ${packets} part(s) of ${packetSize / 1024} KB")
+                sendPart(buf, p)
                 sent += want
                 progress(sent)
             }
@@ -240,18 +242,24 @@ class OdinConnection(
         }
     }
 
-    private fun sendPart(buf: ByteArray) {
+    /** Data packets are acknowledged with response type 0x00 whose data field is the part index. */
+    private fun sendPart(buf: ByteArray, index: Int) {
         send(buf)
         if (zlpData) zlp()
-        try {
-            resp(0x66, if (zlpData) 30000 else 5000)
+        val r: Resp = try {
+            resp(0x00, if (zlpData) 30000 else 5000)
         } catch (e: OdinTimeout) {
             if (zlpData) throw e
             log("  no part ack – trying an empty transfer")
             zlp()
-            resp(0x66, 30000)
+            val r2 = resp(0x00, 30000)
             zlpData = true
             log("  (device needs empty transfers after data packets)")
+            r2
+        }
+        if (r.data != index && !warnedIndex) {
+            warnedIndex = true
+            log("  note: part ack index ${r.data}, expected $index")
         }
     }
 
