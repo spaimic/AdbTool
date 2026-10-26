@@ -48,6 +48,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var cmdInput: EditText
     private lateinit var remotePath: EditText
     private lateinit var chkReboot: CheckBox
+    private lateinit var chkRoot: CheckBox
     private lateinit var controls: View
 
     private val exec = Executors.newSingleThreadExecutor()
@@ -113,6 +114,7 @@ class MainActivity : ComponentActivity() {
         cmdInput = findViewById(R.id.cmdInput)
         remotePath = findViewById(R.id.remotePath)
         chkReboot = findViewById(R.id.chkReboot)
+        chkRoot = findViewById(R.id.chkRoot)
         controls = findViewById(R.id.controls)
 
         val filter = IntentFilter().apply {
@@ -300,9 +302,12 @@ class MainActivity : ComponentActivity() {
     private fun doShell() {
         val cmd = cmdInput.text.toString().trim()
         if (cmd.isEmpty()) return
+        val asRoot = chkRoot.isChecked
+        // su -c '<cmd>' with single quotes escaped, so pipes, redirects and spaces survive.
+        val full = if (asRoot) "su -c '" + cmd.replace("'", "'\\''") + "'" else cmd
         runOp("shell") { c ->
-            log("$ $cmd")
-            c.shell(cmd) { logRaw(it) }
+            log((if (asRoot) "# " else "$ ") + cmd)
+            c.shell(full) { logRaw(it) }
             log("")
         }
     }
