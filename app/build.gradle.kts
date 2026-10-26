@@ -3,15 +3,29 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Signing key comes from the build environment (GitHub Actions secrets). Without it, the default debug key is used.
+val keystorePath: String? = System.getenv("KEYSTORE_FILE")
+
 android {
     namespace = "com.spaimic.adbtool"
     compileSdk = 34
+
+    signingConfigs {
+        getByName("debug") {
+            if (keystorePath != null) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
 
     defaultConfig {
         applicationId = "com.spaimic.adbtool"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
         versionName = "1.0"
     }
 
