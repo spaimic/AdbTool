@@ -16,6 +16,8 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -28,6 +30,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import java.io.FileInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -44,12 +47,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var cmdInput: EditText
     private lateinit var remotePath: EditText
+    private lateinit var chkReboot: CheckBox
+    private lateinit var controls: View
 
     private val exec = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
     @Volatile private var conn: AdbConnection? = null
+    @Volatile private var odinConn: OdinConnection? = null
     private var pullRemote = ""
-    private lateinit var chkReboot: CheckBox
     private var pendingFlash: List<FlashItem>? = null
     private val slots = listOf(Slot("BL"), Slot("AP"), Slot("CP"), Slot("CSC"), Slot("USERDATA"))
     private var pickingSlot: Slot? = null
@@ -84,6 +89,8 @@ class MainActivity : ComponentActivity() {
                     else connect(dev)
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val d = deviceFrom(i)
+                    if (d == null || d.vendorId == 0x04E8) odinConn?.close()
                     if (conn != null) {
                         conn?.close()
                         conn = null
@@ -106,6 +113,7 @@ class MainActivity : ComponentActivity() {
         cmdInput = findViewById(R.id.cmdInput)
         remotePath = findViewById(R.id.remotePath)
         chkReboot = findViewById(R.id.chkReboot)
+        controls = findViewById(R.id.controls)
 
         val filter = IntentFilter().apply {
             addAction(ACTION_PERMISSION)
@@ -138,6 +146,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         unregisterReceiver(receiver)
         conn?.close()
+        odinConn?.close()
         exec.shutdownNow()
     }
 
@@ -158,6 +167,23 @@ class MainActivity : ComponentActivity() {
     private fun setStatus(s: String) = ui { status.text = s }
     private fun showProgress(p: Int) = ui { progress.progress = p }
 
+    /** Only one operation at a time: every button is disabled while one runs. */
+    private fun beginOp(): Boolean {
+        if (!busy.compareAndSet(false, true)) return false
+        ui { setEnabledRec(controls, false) }
+        return true
+    }
+
+    private fun endOp() {
+        busy.set(false)
+        ui { setEnabledRec(controls, true) }
+    }
+
+    private fun setEnabledRec(v: View, enabled: Boolean) {
+        if (v is Button || v is CheckBox || v is EditText) v.isEnabled = enabled
+        if (v is ViewGroup) for (i in 0 until v.childCount) setEnabledRec(v.getChildAt(i), enabled)
+    }
+
     @Suppress("DEPRECATION")
     private fun deviceFrom(i: Intent): UsbDevice? =
         if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
@@ -168,22 +194,38 @@ class MainActivity : ComponentActivity() {
             if (it.moveToFirst()) it.getString(0) else null
         } ?: "file"
 
+    private fun modelFrom(banner: String): String =
+        Regex("ro\\.product\\.model=([^;]*)").find(banner)?.groupValues?.get(1)?.ifEmpty { null } ?: "device"
+
+    private fun reasonOf(e: Exception): String {
+        val m = e.message ?: e.javaClass.simpleName
+        return when {
+            m.contains("Disconnected") || m.contains("device gone") ||
+                m.contains("USB write failed") || m.contains("USB read failed") -> "Device Unplugged!!"
+            m.contains("Timed out") -> "Device stopped responding"
+            else -> m
+        }
+    }
+
+    private fun sizeText(b: Long): String =
+        if (b >= 1024 * 1024) "${b / (1024 * 1024)} MB" else "${b / 1024} KB"
+
     private fun runOp(name: String, block: (AdbConnection) -> Unit) {
         val c = conn ?: run { log("Not connected"); return }
-        if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
+        if (!beginOp()) return
         exec.execute {
             try {
                 block(c)
             } catch (e: Exception) {
                 log("✗ $name failed: ${e.message}")
             } finally {
-                busy.set(false)
+                endOp()
                 showProgress(0)
             }
         }
     }
 
-    // ------------------------------------------------------------ connection
+    // ------------------------------------------------------------ ADB connection
 
     private fun findAdbDevice(): UsbDevice? = usbManager.deviceList.values.firstOrNull { d ->
         (0 until d.interfaceCount).any {
@@ -214,42 +256,35 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun connect(dev: UsbDevice) {
-        if (!busy.compareAndSet(false, true)) return
+        if (!beginOp()) return
         setStatus("Connecting…")
         exec.execute {
             var c: AdbConnection? = null
             try {
-                var iface: android.hardware.usb.UsbInterface? = null
+                var iface: UsbInterface? = null
                 for (n in 0 until dev.interfaceCount) {
                     val i = dev.getInterface(n)
                     if (i.interfaceClass == 255 && i.interfaceSubclass == 66 && i.interfaceProtocol == 1) { iface = i; break }
                 }
                 if (iface == null) throw IOException("No ADB interface")
-                var epIn: android.hardware.usb.UsbEndpoint? = null
-                var epOut: android.hardware.usb.UsbEndpoint? = null
-                for (n in 0 until iface.endpointCount) {
-                    val e = iface.getEndpoint(n)
-                    if (e.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                        if (e.direction == UsbConstants.USB_DIR_IN) epIn = e else epOut = e
-                    }
-                }
-                if (epIn == null || epOut == null) throw IOException("ADB bulk endpoints not found")
+                val eps = bulkEndpoints(iface) ?: throw IOException("ADB bulk endpoints not found")
 
                 val usb = usbManager.openDevice(dev) ?: throw IOException("openDevice failed")
                 if (!usb.claimInterface(iface, true)) { usb.close(); throw IOException("claimInterface failed") }
 
-                c = AdbConnection(usb, iface, epIn, epOut, AdbKeyStore.load(this))
+                c = AdbConnection(usb, iface, eps.first, eps.second, AdbKeyStore.load(this))
                 c.onAuthPrompt = { setStatus("Tap “Allow” on the target device…") }
                 val banner = c.connect()
                 conn = c
-                setStatus("Connected: $banner")
-                log("Connected: $banner")
+                val model = modelFrom(banner)
+                setStatus("Connected: $model")
+                log("Connected: $model")
             } catch (e: Exception) {
                 c?.close()
                 setStatus("Not connected")
                 log("✗ Connect failed: ${e.message}")
             } finally {
-                busy.set(false)
+                endOp()
             }
         }
     }
@@ -260,7 +295,7 @@ class MainActivity : ComponentActivity() {
         setStatus("Not connected")
     }
 
-    // ------------------------------------------------------------ operations
+    // ------------------------------------------------------------ ADB operations
 
     private fun doShell() {
         val cmd = cmdInput.text.toString().trim()
@@ -290,7 +325,7 @@ class MainActivity : ComponentActivity() {
             val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("Cannot open file")
             pfd.use { p ->
                 val size = p.statSize
-                log("Pushing $name → $remote ($size bytes)")
+                log("Pushing $name → $remote (${sizeText(size)})")
                 FileInputStream(p.fileDescriptor).use { ins ->
                     c.push(ins, remote) { done -> if (size > 0) showProgress((done * 100 / size).toInt()) }
                 }
@@ -305,7 +340,7 @@ class MainActivity : ComponentActivity() {
             log("Pulling $remote…")
             val out = contentResolver.openOutputStream(uri) ?: throw IOException("Cannot write file")
             val total = out.use { c.pull(remote, it) { } }
-            log("✓ Pull complete ($total bytes)")
+            log("✓ Pull complete (${sizeText(total)})")
         }
     }
 
@@ -316,7 +351,7 @@ class MainActivity : ComponentActivity() {
             pfd.use { p ->
                 val size = p.statSize
                 if (size <= 0) throw IOException("Cannot determine file size")
-                log("Sideloading $name ($size bytes)…")
+                log("Sideloading $name (${sizeText(size)})…")
                 FileInputStream(p.fileDescriptor).channel.use { ch ->
                     val done = c.sideload(ch, size) { sent, total -> showProgress((sent * 100 / total).toInt()) }
                     log(if (done) "✓ Sideload finished" else "Stream closed by device – check its screen")
@@ -397,8 +432,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Maps a tar entry such as "system.img.ext4.lz4" to a partition of the device. */
+    private fun partitionFor(entryName: String, pit: List<PitEntry>): PitEntry? {
+        var base = entryName.substringAfterLast('/')
+        if (base.endsWith(".lz4", ignoreCase = true)) base = base.dropLast(4)
+        val names = ArrayList<String>()
+        names.add(base)
+        if (base.endsWith(".ext4", ignoreCase = true)) names.add(base.dropLast(5))
+        for (n in names) {
+            val p = pit.firstOrNull { it.flashName.equals(n, ignoreCase = true) }
+            if (p != null) return p
+        }
+        for (n in names) {
+            val stem = n.substringBefore('.')
+            val p = pit.firstOrNull { it.name.equals(stem, ignoreCase = true) }
+            if (p != null) return p
+        }
+        return null
+    }
+
     private fun loadSlot(slot: Slot, uri: Uri) {
-        if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
+        if (!beginOp()) return
         val name = displayName(uri)
         exec.execute {
             try {
@@ -406,17 +460,20 @@ class MainActivity : ComponentActivity() {
                 pfd.use { p ->
                     FileInputStream(p.fileDescriptor).channel.use { ch ->
                         if (name.endsWith(".md5", ignoreCase = true)) {
-                            log("Verifying MD5 of $name…")
-                            when (TarUtil.verifyMd5(ch)) {
-                                true -> log("✓ MD5 OK")
+                            log("Checking $name…")
+                            when (TarUtil.verifyMd5(ch) { pct -> showProgress(pct) }) {
+                                true -> {}
                                 false -> throw IOException("MD5 mismatch – the file is corrupt")
-                                null -> log("No MD5 line found, skipping check")
+                                null -> {}
                             }
                         }
-                        val entries = TarUtil.list(ch)
-                        if (entries.isEmpty()) throw IOException("No files found in the tar")
-                        val lz4 = entries.firstOrNull { it.name.endsWith(".lz4", ignoreCase = true) }
-                        if (lz4 != null) throw IOException("${lz4.name}: LZ4-compressed images are not supported yet")
+                        // Folders (meta-data/…) and .pit files are not flashed, like Odin.
+                        val entries = TarUtil.list(ch).filter { !it.name.contains('/') && !it.name.endsWith(".pit", true) }
+                        if (entries.isEmpty()) throw IOException("No flashable files found in the tar")
+                        if (entries.any { it.lz4 }) log("Reading compressed images…")
+                        for (e in entries) {
+                            if (e.lz4) e.rawSize = Lz4.measure(ch, e.dataOffset, e.size)
+                        }
                         slot.uri = uri
                         slot.name = name
                         slot.entries = entries
@@ -426,7 +483,8 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 log("✗ ${slot.label}: ${e.message}")
             } finally {
-                busy.set(false)
+                endOp()
+                showProgress(0)
             }
         }
     }
@@ -435,7 +493,7 @@ class MainActivity : ComponentActivity() {
         val items = slots.filter { it.uri != null }.map { FlashItem(it.label, it.uri!!, it.name, it.entries) }
         if (items.isEmpty()) { log("Select at least one file first"); return }
         val msg = items.joinToString("\n\n") { item ->
-            "${item.slot}: ${item.name}\n" + item.entries.joinToString("\n") { "  • ${it.name} (${it.size / 1024} KB)" }
+            "${item.slot}: ${item.name}\n" + item.entries.joinToString("\n") { "  • ${it.name} (${sizeText(it.rawSize)})" }
         }
         AlertDialog.Builder(this)
             .setTitle("Flash in Download Mode?")
@@ -448,7 +506,7 @@ class MainActivity : ComponentActivity() {
     private fun startOdin(items: List<FlashItem>) {
         val dev = usbManager.deviceList.values.firstOrNull { odinInterface(it) != null }
         if (dev == null) {
-            log("No Download Mode device found. Boot the target into Download Mode and connect it via OTG.")
+            log("❌ Error: Unable to flash, REASON : No Download Mode device found")
             log("USB devices seen: ${describeUsb()}")
             return
         }
@@ -464,10 +522,11 @@ class MainActivity : ComponentActivity() {
     private fun odinFlash(dev: UsbDevice) {
         val items = pendingFlash ?: return
         pendingFlash = null
-        if (!busy.compareAndSet(false, true)) { log("Busy – wait for the current operation"); return }
+        if (!beginOp()) return
         val reboot = chkReboot.isChecked
         exec.execute {
             var odin: OdinConnection? = null
+            var current: String? = null
             try {
                 val iface = odinInterface(dev) ?: throw IOException("No Odin interface")
                 val eps = bulkEndpoints(iface) ?: throw IOException("Odin bulk endpoints not found")
@@ -476,8 +535,6 @@ class MainActivity : ComponentActivity() {
                     val i = dev.getInterface(n)
                     if (i.interfaceClass == UsbConstants.USB_CLASS_COMM) { ctrl = i; break }
                 }
-                log("Data interface #${iface.id}: IN 0x${Integer.toHexString(eps.first.address)}, " +
-                    "OUT 0x${Integer.toHexString(eps.second.address)}, max packet ${eps.first.maxPacketSize}")
 
                 val usb = usbManager.openDevice(dev) ?: throw IOException("openDevice failed")
                 if (ctrl != null) usb.claimInterface(ctrl, true)
@@ -485,40 +542,33 @@ class MainActivity : ComponentActivity() {
                 usb.setInterface(iface)
                 val o = OdinConnection(usb, iface, ctrl, eps.first, eps.second)
                 odin = o
-                o.log = { log(it) }
+                odinConn = o
 
                 setStatus("Download Mode: flashing…")
-                log("Setting up serial lines…")
                 o.setupSerial()
-                log("Handshake…")
                 o.handshake()
-                log("LOKE received. Starting session…")
-                val dflt = o.beginSession()
-                log("Session open (0x${Integer.toHexString(dflt)}). Reading PIT…")
+                o.beginSession()
                 val pit = OdinConnection.parsePit(o.downloadPit())
-                log("PIT: ${pit.size} partitions")
 
                 // Map every file to a partition BEFORE writing anything.
                 val plan = ArrayList<PlanStep>()
                 for (item in items) {
                     for (e in item.entries) {
-                        val base = e.name.substringAfterLast('/')
-                        val p = pit.firstOrNull { it.flashName.equals(base, ignoreCase = true) }
-                            ?: pit.firstOrNull { it.name.equals(base.substringBeforeLast('.'), ignoreCase = true) }
-                            ?: throw IOException("${e.name}: no matching partition in the device PIT – nothing was flashed")
+                        val p = partitionFor(e.name, pit)
+                        if (p == null) {
+                            current = e.name.substringAfterLast('/')
+                            throw IOException("No matching partition on this device")
+                        }
                         val wantModem = item.slot == "CP"
                         if ((p.binaryType == 1) != wantModem) {
-                            throw IOException(
-                                "${e.name} maps to ${p.name}, which is a ${if (p.binaryType == 1) "modem (CP)" else "non-modem"} " +
-                                    "partition, but it is in the ${item.slot} slot – nothing was flashed"
-                            )
+                            current = p.name
+                            throw IOException("It belongs to the ${if (wantModem) "AP/BL/CSC" else "CP"} slot, not ${item.slot}")
                         }
                         plan.add(PlanStep(item, e, p))
-                        log("${item.slot}: ${e.name} → ${p.name} (id ${p.id}, dev ${p.deviceType})")
                     }
                 }
 
-                val total = plan.fold(0L) { a, st -> a + st.entry.size }
+                val total = plan.fold(0L) { a, st -> a + st.entry.rawSize }
                 o.totalBytes(total)
 
                 var done = 0L
@@ -527,31 +577,41 @@ class MainActivity : ComponentActivity() {
                     pfd.use { pf ->
                         FileInputStream(pf.fileDescriptor).channel.use { ch ->
                             for (st in plan.filter { it.item === item }) {
-                                log("Flashing ${st.entry.name}…")
+                                current = st.part.name
+                                log("Flashing ${st.part.name}...")
+                                val input: InputStream =
+                                    if (st.entry.lz4) Lz4InputStream(ch, st.entry.dataOffset, st.entry.size)
+                                    else ChannelRangeStream(ch, st.entry.dataOffset, st.entry.size)
                                 val base = done
-                                o.flash(ch, st.entry.dataOffset, st.entry.size, st.part, st.part.binaryType == 1) { sent ->
+                                o.flash(input, st.entry.rawSize, st.part, st.part.binaryType == 1) { sent ->
                                     showProgress(((base + sent) * 100 / total).toInt())
                                 }
-                                done += st.entry.size
-                                log("✓ ${st.part.name}")
+                                if (input is Lz4InputStream && input.read() != -1) {
+                                    throw IOException("Decompressed size differs from the file header")
+                                }
+                                done += st.entry.rawSize
+                                log("✅ Successfully Flashed ${st.part.name}")
+                                current = null
                             }
                         }
                     }
                 }
 
+                current = null
                 o.endSession()
-                if (reboot) {
-                    o.reboot()
-                    log("✓ Flash complete – rebooting")
-                } else {
-                    log("✓ Flash complete – device is still in Download Mode")
-                }
+                if (reboot) o.reboot()
             } catch (e: Exception) {
-                log("✗ Download Mode flash failed: ${e.message}")
+                val why = reasonOf(e)
+                val c = current
+                log(
+                    if (c != null) "❌ Error: Unable to flash $c, REASON : $why"
+                    else "❌ Error: Unable to start flashing, REASON : $why"
+                )
                 try { odin?.endSession(2000) } catch (_: Exception) {}
             } finally {
                 odin?.close()
-                busy.set(false)
+                odinConn = null
+                endOp()
                 showProgress(0)
                 if (conn == null) setStatus("Not connected")
             }

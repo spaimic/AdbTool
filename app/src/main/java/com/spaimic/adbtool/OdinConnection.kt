@@ -4,10 +4,11 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.os.SystemClock
+import android.util.Log
 import java.io.IOException
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.channels.FileChannel
 import kotlin.math.min
 
 class PitEntry(
@@ -29,7 +30,8 @@ class OdinConnection(
     private class Resp(val type: Int, val data: Int)
     private class OdinTimeout(msg: String) : IOException(msg)
 
-    var log: (String) -> Unit = {}
+    /** Protocol trace; goes to logcat only (tag "AdbTool.Odin"), never to the user-facing log. */
+    var log: (String) -> Unit = { Log.d("AdbTool.Odin", it) }
 
     @Volatile private var closed = false
     private var packetSize = 131072
@@ -201,8 +203,8 @@ class OdinConnection(
         ask(pkt(0x64, 2, total.toInt(), (total ushr 32).toInt())) { resp(0x64, it) }
     }
 
-    /** Flashes one file (a region of [ch]) to the partition described by [e]. */
-    fun flash(ch: FileChannel, dataOffset: Long, size: Long, e: PitEntry, modem: Boolean, progress: (Long) -> Unit) {
+    /** Flashes [size] bytes read from [input] to the partition described by [e]. */
+    fun flash(input: InputStream, size: Long, e: PitEntry, modem: Boolean, progress: (Long) -> Unit) {
         ask(pkt(0x66, 0)) { resp(0x66, it) }
 
         val seqBytes = seqMax.toLong() * packetSize
@@ -220,15 +222,13 @@ class OdinConnection(
 
             for (p in 0 until packets) {
                 val want = min(packetSize.toLong(), effective - p.toLong() * packetSize).toInt()
-                val bb = ByteBuffer.wrap(buf, 0, want)
-                var pos = dataOffset + seqStart + p.toLong() * packetSize
-                while (bb.hasRemaining()) {
-                    val n = ch.read(bb, pos)
-                    if (n < 0) throw IOException("Unexpected end of file")
-                    pos += n
+                var got = 0
+                while (got < want) {
+                    val n = input.read(buf, got, want - got)
+                    if (n < 0) throw IOException("Image data ended early")
+                    got += n
                 }
                 java.util.Arrays.fill(buf, want, buf.size, 0.toByte())
-                if (p == 0) log("  data: ${packets} part(s) of ${packetSize / 1024} KB")
                 sendPart(buf, p)
                 sent += want
                 progress(sent)
@@ -239,6 +239,7 @@ class OdinConnection(
             else pkt(0x66, 3, 0, effective.toInt(), 0, e.deviceType, e.id, last)
             val r = ask(endPkt, 300000, probe = false) { resp(0x66, it) }
             log("  device status: ${r.data}")
+            if (r.data != 0) throw IOException("Device rejected the data (status ${r.data})")
         }
     }
 

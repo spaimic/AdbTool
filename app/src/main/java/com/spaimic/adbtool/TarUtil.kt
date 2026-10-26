@@ -6,7 +6,11 @@ import java.nio.channels.FileChannel
 import java.security.MessageDigest
 import kotlin.math.min
 
-class TarEntry(val name: String, val size: Long, val dataOffset: Long)
+class TarEntry(val name: String, val size: Long, val dataOffset: Long) {
+    val lz4: Boolean get() = name.endsWith(".lz4", ignoreCase = true)
+    /** Size after decompression (equals [size] for plain files). */
+    var rawSize: Long = size
+}
 
 /** Minimal tar reader for Odin-style .tar / .tar.md5 files. Random access, nothing is extracted. */
 object TarUtil {
@@ -48,7 +52,7 @@ object TarUtil {
     }
 
     /** true = MD5 matches, false = mismatch, null = no MD5 line at the end of the file. */
-    fun verifyMd5(ch: FileChannel): Boolean? {
+    fun verifyMd5(ch: FileChannel, progress: (Int) -> Unit = {}): Boolean? {
         val total = ch.size()
         val tailLen = min(total, 1024L).toInt()
         val tail = ByteBuffer.allocate(tailLen)
@@ -70,6 +74,7 @@ object TarUtil {
             readAt(ch, buf, pos)
             md.update(buf.array(), 0, buf.limit())
             pos += buf.limit()
+            progress((pos * 100 / contentLen).toInt())
         }
         return md.digest().joinToString("") { "%02x".format(it) } == hash
     }
