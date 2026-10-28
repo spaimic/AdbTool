@@ -216,6 +216,9 @@ class AdbConnection(
         } finally { s.close() }
     }
 
+    /** Opens a sync session for listing directories and receiving several files over one stream. */
+    fun sync(): SyncSession = SyncSession(open("sync:"))
+
     /** adb sideload: the device requests 64 KiB blocks by number; we serve them from the file. Returns true on DONEDONE. */
     fun sideload(file: FileChannel, size: Long, progress: (Long, Long) -> Unit): Boolean {
         val bs = 65536
@@ -296,4 +299,68 @@ class AdbStream(private val conn: AdbConnection, private val localId: Int, priva
         closed = true
         try { conn.send(A_CLSE, localId, remoteId) } catch (_: IOException) {}
     }
+}
+
+class DirEntry(val name: String, val mode: Int, val size: Long, val mtime: Long) {
+    val isDir: Boolean get() = (mode and 0xF000) == 0x4000
+    val isLink: Boolean get() = (mode and 0xF000) == 0xA000
+    val isFile: Boolean get() = (mode and 0xF000) == 0x8000
+}
+
+/** Parses the answer to a sync LIST request; [readExact] supplies bytes from the stream. */
+fun parseDirList(readExact: (Int) -> ByteArray): List<DirEntry> {
+    val out = ArrayList<DirEntry>()
+    while (true) {
+        val h = ByteBuffer.wrap(readExact(20)).order(ByteOrder.LITTLE_ENDIAN)
+        val idBytes = ByteArray(4)
+        h.get(idBytes)
+        val id = String(idBytes)
+        val mode = h.int
+        val size = h.int.toLong() and 0xffffffffL
+        val time = h.int.toLong() and 0xffffffffL
+        val nameLen = h.int
+        if (id == "DONE") break
+        if (id != "DENT") throw IOException("Unexpected sync reply: $id")
+        val name = String(readExact(nameLen), Charsets.UTF_8)
+        if (name != "." && name != "..") out.add(DirEntry(name, mode, size, time))
+    }
+    return out
+}
+
+class SyncSession(private val s: AdbStream) {
+    private fun hdr(id: String, n: Int): ByteArray =
+        ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).put(id.toByteArray()).putInt(n).array()
+
+    fun list(path: String): List<DirEntry> {
+        val p = path.toByteArray()
+        s.write(hdr("LIST", p.size) + p)
+        return parseDirList { s.readExact(it) }
+    }
+
+    /** Receives one file into [out]. A failure reported by the device leaves the session usable. */
+    fun recv(remote: String, out: OutputStream, progress: (Long) -> Unit): Long {
+        val p = remote.toByteArray()
+        s.write(hdr("RECV", p.size) + p)
+        var total = 0L
+        while (true) {
+            val h = s.readExact(8)
+            val id = String(h, 0, 4)
+            val len = ByteBuffer.wrap(h, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            when (id) {
+                "DATA" -> { out.write(s.readExact(len)); total += len; progress(total) }
+                "DONE" -> return total
+                "FAIL" -> throw IOException(String(s.readExact(len)))
+                else -> throw IOException("Unexpected sync reply: $id")
+            }
+        }
+    }
+
+    /** Ends the session politely. */
+    fun close() {
+        try { s.write(hdr("QUIT", 0)) } catch (_: IOException) {}
+        s.close()
+    }
+
+    /** Drops the stream immediately (used while a transfer is still running). */
+    fun abort() = s.close()
 }

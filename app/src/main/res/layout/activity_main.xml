@@ -32,6 +32,8 @@
                 <Button android:id="@+id/btnDisconnect" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:text="Disconnect" />
             </LinearLayout>
 
+            <Button android:id="@+id/btnBrowse" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Browse target files" />
+
             <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="16dp" android:text="Shell command" android:textStyle="bold" />
             <EditText android:id="@+id/cmdInput" android:layout_width="match_parent" android:layout_height="wrap_content" android:hint="getprop ro.product.model" android:inputType="text" android:singleLine="true" />
             <CheckBox android:id="@+id/chkRoot" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Run as root (su)" />

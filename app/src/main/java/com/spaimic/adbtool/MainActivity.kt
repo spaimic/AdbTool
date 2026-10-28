@@ -52,8 +52,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var controls: View
 
     private val exec = Executors.newSingleThreadExecutor()
-    private val busy = AtomicBoolean(false)
-    @Volatile private var conn: AdbConnection? = null
+    private val busy = AdbSession.busy
+    private var conn: AdbConnection?
+        get() = AdbSession.conn
+        set(v) { AdbSession.conn = v }
     @Volatile private var odinConn: OdinConnection? = null
     private var pullRemote = ""
     private var pendingFlash: List<FlashItem>? = null
@@ -116,6 +118,7 @@ class MainActivity : ComponentActivity() {
         chkReboot = findViewById(R.id.chkReboot)
         chkRoot = findViewById(R.id.chkRoot)
         controls = findViewById(R.id.controls)
+        if (conn != null) setStatus("Connected: ${AdbSession.model}")
 
         val filter = IntentFilter().apply {
             addAction(ACTION_PERMISSION)
@@ -125,6 +128,11 @@ class MainActivity : ComponentActivity() {
 
         findViewById<Button>(R.id.btnConnect).setOnClickListener { onConnectClicked() }
         findViewById<Button>(R.id.btnDisconnect).setOnClickListener { disconnect() }
+        findViewById<Button>(R.id.btnBrowse).setOnClickListener {
+            val c = conn
+            if (c == null || c.closed) log("Connect to the target device first")
+            else startActivity(Intent(this, FileBrowserActivity::class.java))
+        }
         findViewById<Button>(R.id.btnRun).setOnClickListener { doShell() }
         findViewById<Button>(R.id.btnReboot).setOnClickListener { doReboot("") }
         findViewById<Button>(R.id.btnRecovery).setOnClickListener { doReboot("recovery") }
@@ -144,12 +152,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        val c = conn
+        if (c != null && c.closed) conn = null
+        if (!busy.get()) setStatus(if (conn != null) "Connected: ${AdbSession.model}" else "Not connected")
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(receiver)
-        conn?.close()
-        odinConn?.close()
-        exec.shutdownNow()
+        if (isFinishing) {          // keep the connection alive across screen changes
+            conn?.close()
+            conn = null
+            odinConn?.close()
+        }
+        exec.shutdown()
     }
 
     // ------------------------------------------------------------ helpers
@@ -279,6 +297,7 @@ class MainActivity : ComponentActivity() {
                 val banner = c.connect()
                 conn = c
                 val model = modelFrom(banner)
+                AdbSession.model = model
                 setStatus("Connected: $model")
                 log("Connected: $model")
             } catch (e: Exception) {
