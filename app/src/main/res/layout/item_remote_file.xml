@@ -53,4 +53,13 @@
         android:paddingEnd="14dp"
         android:text="Pull"
         android:textAllCaps="false" />
+
+    <ImageButton
+        android:id="@+id/btnMore"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:contentDescription="More"
+        android:focusable="false"
+        android:src="@drawable/ic_more" />
 </LinearLayout>

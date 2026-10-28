@@ -34,6 +34,7 @@ class OdinConnection(
     var log: (String) -> Unit = { Log.d("AdbTool.Odin", it) }
 
     @Volatile private var closed = false
+    val isOpen: Boolean get() = !closed
     private var packetSize = 131072
     private var seqMax = 800
     private val rbuf = ByteArray(2048)

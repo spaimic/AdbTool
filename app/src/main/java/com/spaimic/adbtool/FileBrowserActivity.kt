@@ -1,25 +1,40 @@
 package com.spaimic.adbtool
 
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
+import android.content.Context
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.MimeTypeMap
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import java.io.BufferedOutputStream
+import java.io.FileInputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.text.DateFormat
@@ -28,7 +43,7 @@ import java.util.concurrent.Executors
 import kotlin.math.ln
 import kotlin.math.pow
 
-/** Browses the target device's files over ADB; "Pull" copies a file or folder to this device's Download folder. */
+/** Browses the target device's files over ADB and manages them (pull, push, create, delete, rename, chmod, SHA-256). */
 class FileBrowserActivity : ComponentActivity() {
 
     private class PullItem(val remote: String, val rel: String, val name: String, val size: Long, val link: Boolean)
@@ -41,11 +56,17 @@ class FileBrowserActivity : ComponentActivity() {
     private lateinit var btnUp: ImageButton
     private lateinit var btnRefresh: ImageButton
     private lateinit var btnCancel: Button
+    private lateinit var btnPush: Button
+    private lateinit var btnNew: Button
     private lateinit var adapter: RemoteAdapter
 
     private val exec = Executors.newSingleThreadExecutor()
     private var path = "/sdcard"
     @Volatile private var cancel = false
+
+    private val pushPicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) confirmPush(uris)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,8 +79,10 @@ class FileBrowserActivity : ComponentActivity() {
         btnUp = findViewById(R.id.btnUp)
         btnRefresh = findViewById(R.id.btnRefresh)
         btnCancel = findViewById(R.id.btnCancel)
+        btnPush = findViewById(R.id.btnPush)
+        btnNew = findViewById(R.id.btnNew)
 
-        adapter = RemoteAdapter({ openEntry(it) }, { pull(it) })
+        adapter = RemoteAdapter({ openEntry(it) }, { pull(it) }, { e, anchor -> showMenu(e, anchor) })
         val list = findViewById<RecyclerView>(R.id.fileList)
         list.layoutManager = LinearLayoutManager(this)
         list.adapter = adapter
@@ -70,6 +93,8 @@ class FileBrowserActivity : ComponentActivity() {
             cancel = true
             btnCancel.isEnabled = false
         }
+        btnPush.setOnClickListener { if (!AdbSession.busy.get()) pushPicker.launch(arrayOf("*/*")) }
+        btnNew.setOnClickListener { v -> if (!AdbSession.busy.get()) showNewMenu(v) }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when {
@@ -111,9 +136,27 @@ class FileBrowserActivity : ComponentActivity() {
 
     private fun join(dir: String, name: String) = if (dir.endsWith("/")) dir + name else "$dir/$name"
 
+    /** Single-quotes a string for the Android shell. */
+    private fun q(s: String) = "'" + s.replace("'", "'\\''") + "'"
+
+    private fun validName(n: String) = n.isNotEmpty() && n != "." && n != ".." && !n.contains('/') && !n.contains('\u0000')
+
+    private fun displayName(uri: Uri): String =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        } ?: "file"
+
+    private fun runShell(c: AdbConnection, cmd: String): String {
+        val sb = StringBuilder()
+        c.shell(cmd) { sb.append(it) }
+        return sb.toString().trim()
+    }
+
     private fun setBusy(busy: Boolean, pulling: Boolean = false) = ui {
         btnUp.isEnabled = !busy
         btnRefresh.isEnabled = !busy
+        btnPush.isEnabled = !busy
+        btnNew.isEnabled = !busy
         adapter.setBusy(busy)
         btnCancel.visibility = if (pulling) View.VISIBLE else View.GONE
         btnCancel.isEnabled = true
@@ -139,9 +182,44 @@ class FileBrowserActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Runs one operation on the target with the screen locked. [block] returns the message to show;
+     * an exception becomes "❌ Error: <errorText>, REASON : …". The list is refreshed afterwards.
+     */
+    private fun task(
+        errorText: String,
+        busyText: String,
+        pulling: Boolean = false,
+        refresh: Boolean = true,
+        block: (AdbConnection) -> String
+    ) {
+        val c = AdbSession.conn
+        if (c == null || c.closed) { connectionLost(); return }
+        if (!AdbSession.busy.compareAndSet(false, true)) return
+        cancel = false
+        setBusy(true, pulling)
+        status(busyText)
+        exec.execute {
+            var msg: String
+            try {
+                msg = block(c)
+            } catch (ex: Exception) {
+                msg = if (ex is PullCancelled) "Cancelled" else "❌ Error: $errorText, REASON : ${AdbSession.reason(ex)}"
+            }
+            AdbSession.busy.set(false)
+            ui {
+                progress.progress = 0
+                statusText.text = msg
+                setBusy(false)
+                toast(msg)
+                if (!connected()) connectionLost() else if (refresh) load(path, msg)
+            }
+        }
+    }
+
     // ------------------------------------------------------------ listing
 
-    private fun load(p: String) {
+    private fun load(p: String, keepStatus: String? = null) {
         val c = AdbSession.conn
         if (c == null || c.closed) { connectionLost(); return }
         if (!AdbSession.busy.compareAndSet(false, true)) return
@@ -159,7 +237,7 @@ class FileBrowserActivity : ComponentActivity() {
                     pathText.text = p
                     adapter.submit(sorted)
                     emptyView.visibility = if (sorted.isEmpty()) View.VISIBLE else View.GONE
-                    statusText.text = "${sorted.size} items"
+                    statusText.text = keepStatus ?: "${sorted.size} items"
                 }
             } catch (e: Exception) {
                 status("❌ Error: Unable to open $p, REASON : ${AdbSession.reason(e)}")
@@ -171,7 +249,7 @@ class FileBrowserActivity : ComponentActivity() {
         }
     }
 
-    // ------------------------------------------------------------ pulling
+    // ------------------------------------------------------------ pull
 
     private fun scan(s: SyncSession, remote: String, rel: String, out: MutableList<PullItem>, depth: Int) {
         if (depth > 40) return
@@ -191,20 +269,10 @@ class FileBrowserActivity : ComponentActivity() {
 
     private fun pull(e: DirEntry) {
         if (Build.VERSION.SDK_INT < 29) { toast("Pulling needs Android 10 or newer on this device"); return }
-        val c = AdbSession.conn
-        if (c == null || c.closed) { connectionLost(); return }
-        if (!AdbSession.busy.compareAndSet(false, true)) return
-        cancel = false
         val remote = join(path, e.name)
-        setBusy(true, pulling = true)
-        status("Pulling ${e.name}…")
-
-        exec.execute {
-            var s: SyncSession? = null
-            var result: String
+        task("Unable to pull ${e.name}", "Pulling ${e.name}…", pulling = true, refresh = false) { c ->
+            val sess = c.sync()
             try {
-                val sess = c.sync()
-                s = sess
                 var asDir = e.isDir
                 if (e.isLink) asDir = sess.list(remote).isNotEmpty()
 
@@ -216,6 +284,7 @@ class FileBrowserActivity : ComponentActivity() {
                     plan.add(PullItem(remote, "", e.name, e.size, e.isLink))
                 }
 
+                val result: String
                 if (plan.isEmpty()) {
                     result = "Folder is empty – nothing to pull"
                 } else {
@@ -256,28 +325,18 @@ class FileBrowserActivity : ComponentActivity() {
                     result = when {
                         failures.isEmpty() ->
                             "✅ Successfully Pulled ${e.name}" + if (asDir) " ($okCount files)" else ""
-                        !asDir -> "❌ Error: Unable to pull ${e.name}, REASON : ${failures.first()}"
+                        !asDir -> throw IOException(failures.first())
                         else -> "⚠ Pulled $okCount of ${plan.size} files from ${e.name}. First error: ${failures.first()}"
                     }
                 }
                 sess.close()
+                result
             } catch (ex: Exception) {
-                result = if (ex is PullCancelled) "Cancelled"
-                else "❌ Error: Unable to pull ${e.name}, REASON : ${AdbSession.reason(ex)}"
-                s?.abort()
-            }
-            AdbSession.busy.set(false)
-            ui {
-                progress.progress = 0
-                statusText.text = result
-                setBusy(false)
-                toast(result)
-                if (!connected()) connectionLost()
+                sess.abort()
+                throw ex
             }
         }
     }
-
-    // ------------------------------------------------------------ writing to Download
 
     private fun createDownload(rel: String, name: String): Pair<Uri, OutputStream> {
         val ext = name.substringAfterLast('.', "").lowercase()
@@ -306,13 +365,258 @@ class FileBrowserActivity : ComponentActivity() {
     private fun deleteDownload(uri: Uri) {
         try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
     }
+
+    // ------------------------------------------------------------ push
+
+    private fun confirmPush(uris: List<Uri>) {
+        val names = uris.map { displayName(it) }
+        val clashes = names.filter { adapter.has(it) }
+        if (clashes.isEmpty()) {
+            pushFiles(uris, names)
+        } else {
+            AlertDialog.Builder(this)
+                .setTitle("Overwrite?")
+                .setMessage("Already in $path:\n" + clashes.joinToString("\n") { "• $it" })
+                .setPositiveButton("Overwrite") { _, _ -> pushFiles(uris, names) }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+    }
+
+    private fun pushFiles(uris: List<Uri>, names: List<String>) {
+        val dir = path
+        task("Unable to push to $dir", "Pushing…") { c ->
+            val sizes = uris.map { u -> contentResolver.openFileDescriptor(u, "r")?.use { it.statSize } ?: 0L }
+            val total = sizes.sum()
+            var before = 0L
+            var lastUi = 0L
+            for ((i, uri) in uris.withIndex()) {
+                if (cancel) throw PullCancelled()
+                status("Pushing ${names[i]} (${i + 1}/${uris.size})")
+                val pfd = contentResolver.openFileDescriptor(uri, "r") ?: throw IOException("Cannot open ${names[i]}")
+                pfd.use { p ->
+                    FileInputStream(p.fileDescriptor).use { ins ->
+                        c.push(ins, join(dir, names[i])) { done ->
+                            val now = System.currentTimeMillis()
+                            if (now - lastUi > 150 && total > 0) {
+                                lastUi = now
+                                val pct = ((before + done) * 100 / total).toInt().coerceIn(0, 100)
+                                ui { progress.progress = pct }
+                            }
+                        }
+                    }
+                }
+                before += sizes[i]
+            }
+            "✅ Successfully Pushed " + if (uris.size == 1) names[0] else "${uris.size} files"
+        }
+    }
+
+    // ------------------------------------------------------------ create
+
+    private fun askName(title: String, initial: String, positive: String, onOk: (String) -> Unit) {
+        val input = EditText(this)
+        input.setSingleLine(true)
+        input.setText(initial)
+        input.setSelection(0, initial.substringBeforeLast('.', initial).length)
+        val pad = (20 * resources.displayMetrics.density).toInt()
+        val box = FrameLayout(this)
+        box.setPadding(pad, pad / 2, pad, 0)
+        box.addView(input)
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(box)
+            .setPositiveButton(positive) { _, _ -> onOk(input.text.toString().trim()) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showNewMenu(anchor: View) {
+        val m = PopupMenu(this, anchor)
+        m.menu.add(0, 1, 0, "New folder")
+        m.menu.add(0, 2, 1, "New file")
+        m.setOnMenuItemClickListener {
+            create(it.itemId == 1)
+            true
+        }
+        m.show()
+    }
+
+    private fun create(folder: Boolean) {
+        askName(if (folder) "New folder" else "New file", "", "Create") { name ->
+            if (!validName(name)) { toast("Invalid name"); return@askName }
+            if (adapter.has(name)) { toast("$name already exists"); return@askName }
+            val target = join(path, name)
+            task("Unable to create $name", "Creating $name…") { c ->
+                val out = runShell(c, (if (folder) "mkdir " else "touch ") + q(target))
+                if (out.isNotEmpty()) throw IOException(out)
+                "✅ Created $name"
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ ⋮ menu
+
+    private fun showMenu(e: DirEntry, anchor: View) {
+        if (AdbSession.busy.get()) return
+        val m = PopupMenu(this, anchor)
+        m.menu.add(0, 1, 0, "Delete")
+        m.menu.add(0, 2, 1, "Rename")
+        m.menu.add(0, 3, 2, "Permissions")
+        if (!e.isDir) m.menu.add(0, 4, 3, "SHA-256 checksum")
+        m.setOnMenuItemClickListener {
+            when (it.itemId) {
+                1 -> confirmDelete(e)
+                2 -> rename(e)
+                3 -> showPermissions(e)
+                4 -> checksum(e)
+            }
+            true
+        }
+        m.show()
+    }
+
+    private fun confirmDelete(e: DirEntry) {
+        val what = if (e.isDir) "the folder \"${e.name}\" and everything inside it" else "\"${e.name}\""
+        AlertDialog.Builder(this)
+            .setTitle("Delete?")
+            .setMessage("Delete $what from the target device? This can't be undone.")
+            .setPositiveButton("Delete") { _, _ ->
+                val target = join(path, e.name)
+                task("Unable to delete ${e.name}", "Deleting ${e.name}…") { c ->
+                    val out = runShell(c, (if (e.isDir) "rm -rf " else "rm -f ") + q(target))
+                    if (out.isNotEmpty()) throw IOException(out)
+                    "✅ Deleted ${e.name}"
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun rename(e: DirEntry) {
+        askName("Rename", e.name, "Rename") { name ->
+            if (name == e.name) return@askName
+            if (!validName(name)) { toast("Invalid name"); return@askName }
+            if (adapter.has(name)) { toast("$name already exists"); return@askName }
+            val from = join(path, e.name)
+            val to = join(path, name)
+            task("Unable to rename ${e.name}", "Renaming ${e.name}…") { c ->
+                val out = runShell(c, "mv ${q(from)} ${q(to)}")
+                if (out.isNotEmpty()) throw IOException(out)
+                "✅ Renamed ${e.name} → $name"
+            }
+        }
+    }
+
+    private fun checksum(e: DirEntry) {
+        val target = join(path, e.name)
+        task("Unable to read the checksum of ${e.name}", "Calculating SHA-256 of ${e.name}…", refresh = false) { c ->
+            val out = runShell(c, "sha256sum ${q(target)}")
+            val hash = out.lines().map { it.trim().take(64) }.firstOrNull { Regex("[0-9a-fA-F]{64}").matches(it) }
+                ?: throw IOException(out.ifEmpty { "sha256sum is not available on the target" })
+            ui { showHash(e.name, hash.lowercase()) }
+            "✅ SHA-256 of ${e.name} calculated"
+        }
+    }
+
+    private fun showHash(name: String, hash: String) {
+        val pad = (20 * resources.displayMetrics.density).toInt()
+        val t = TextView(this)
+        t.text = hash
+        t.typeface = Typeface.MONOSPACE
+        t.textSize = 14f
+        t.setTextIsSelectable(true)
+        t.setPadding(pad, pad / 2, pad, 0)
+        AlertDialog.Builder(this)
+            .setTitle("SHA-256 – $name")
+            .setView(t)
+            .setPositiveButton("Close", null)
+            .setNeutralButton("Copy") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("SHA-256", hash))
+                toast("Copied")
+            }
+            .show()
+    }
+
+    private fun showPermissions(e: DirEntry) {
+        val mode = e.mode and 0x1FF
+        val dp = resources.displayMetrics.density
+        val pad = (20 * dp).toInt()
+        val cell = (8 * dp).toInt()
+
+        val grid = GridLayout(this)
+        grid.columnCount = 4
+        for (t in arrayOf("", "Read", "Write", "Execute")) {
+            val tv = TextView(this)
+            tv.text = t
+            tv.gravity = Gravity.CENTER
+            tv.setPadding(cell, cell, cell, cell)
+            grid.addView(tv)
+        }
+        val who = arrayOf("Owner", "Group", "Others")
+        val boxes = ArrayList<CheckBox>()
+        val octal = TextView(this)
+        octal.typeface = Typeface.MONOSPACE
+        octal.setPadding(0, cell, 0, cell)
+
+        fun bitOf(index: Int) = 1 shl (8 - index)
+        fun mask(): Int {
+            var m = 0
+            for ((i, b) in boxes.withIndex()) if (b.isChecked) m = m or bitOf(i)
+            return m
+        }
+        fun refreshOctal() { octal.text = "Mode: " + String.format("%03o", mask()) }
+
+        for (w in 0..2) {
+            val label = TextView(this)
+            label.text = who[w]
+            label.setPadding(cell, cell, cell, cell)
+            grid.addView(label)
+            for (b in 0..2) {
+                val cb = CheckBox(this)
+                cb.isChecked = (mode and bitOf(w * 3 + b)) != 0
+                cb.setOnCheckedChangeListener { _, _ -> refreshOctal() }
+                boxes.add(cb)
+                grid.addView(cb)
+            }
+        }
+        refreshOctal()
+
+        val recursive = CheckBox(this)
+        recursive.text = "Apply to everything inside"
+
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(pad, pad / 2, pad, 0)
+        box.addView(grid)
+        box.addView(octal)
+        if (e.isDir) box.addView(recursive)
+
+        AlertDialog.Builder(this)
+            .setTitle("Permissions – ${e.name}")
+            .setView(box)
+            .setPositiveButton("Apply") { _, _ ->
+                val oct = String.format("%03o", mask())
+                val rec = e.isDir && recursive.isChecked
+                val target = join(path, e.name)
+                task("Unable to change permissions of ${e.name}", "Changing permissions…") { c ->
+                    val out = runShell(c, "chmod ${if (rec) "-R " else ""}$oct ${q(target)}")
+                    if (out.isNotEmpty()) throw IOException(out)
+                    "✅ Permissions of ${e.name} set to $oct"
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
 }
 
 // ---------------------------------------------------------------- list adapter
 
 private class RemoteAdapter(
     private val onOpen: (DirEntry) -> Unit,
-    private val onPull: (DirEntry) -> Unit
+    private val onPull: (DirEntry) -> Unit,
+    private val onMenu: (DirEntry, View) -> Unit
 ) : RecyclerView.Adapter<RemoteAdapter.VH>() {
 
     private var items: List<DirEntry> = emptyList()
@@ -328,11 +632,14 @@ private class RemoteAdapter(
         notifyDataSetChanged()
     }
 
+    fun has(name: String): Boolean = items.any { it.name == name }
+
     class VH(v: View) : RecyclerView.ViewHolder(v) {
         val icon: ImageView = v.findViewById(R.id.fileIcon)
         val name: TextView = v.findViewById(R.id.fileName)
         val meta: TextView = v.findViewById(R.id.fileMeta)
         val pull: Button = v.findViewById(R.id.btnPull)
+        val more: ImageButton = v.findViewById(R.id.btnMore)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH =
@@ -350,7 +657,9 @@ private class RemoteAdapter(
         }
         holder.icon.setImageResource(iconFor(e))
         holder.pull.isEnabled = !busy
+        holder.more.isEnabled = !busy
         holder.pull.setOnClickListener { onPull(e) }
+        holder.more.setOnClickListener { onMenu(e, holder.more) }
         holder.itemView.setOnClickListener { onOpen(e) }
     }
 

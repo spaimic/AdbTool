@@ -97,4 +97,32 @@
             android:textColor="?android:attr/textColorSecondary"
             android:visibility="gone" />
     </FrameLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#EEF1F8"
+        android:orientation="horizontal"
+        android:padding="8dp">
+        <Button
+            android:id="@+id/btnPush"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:drawableStart="@drawable/ic_upload"
+            android:drawablePadding="6dp"
+            android:text="Push here"
+            android:textAllCaps="false" />
+        <Button
+            android:id="@+id/btnNew"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:layout_weight="1"
+            android:drawableStart="@drawable/ic_new"
+            android:drawablePadding="6dp"
+            android:text="New…"
+            android:textAllCaps="false" />
+    </LinearLayout>
 </LinearLayout>

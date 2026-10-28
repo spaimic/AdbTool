@@ -14,6 +14,7 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.View
@@ -61,7 +62,13 @@ class MainActivity : ComponentActivity() {
     private var pendingFlash: List<FlashItem>? = null
     private val slots = listOf(Slot("BL"), Slot("AP"), Slot("CP"), Slot("CSC"), Slot("USERDATA"))
     private var pickingSlot: Slot? = null
-    private var waitingOdinPermission = false
+    private enum class Pending { NONE, ADB, ODIN, FLASH }
+    private var pending = Pending.NONE
+    private var pendingSilent = false
+    private var permissionPending = false
+    private var autoBlockedUntil = 0L
+    private var odinPit: List<PitEntry>? = null
+    @Volatile private var connecting: AdbConnection? = null
 
     private val pushPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) doPush(uri)
@@ -83,22 +90,38 @@ class MainActivity : ComponentActivity() {
                 ACTION_PERMISSION -> {
                     val dev = deviceFrom(i)
                     val granted = i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    val odin = waitingOdinPermission
-                    waitingOdinPermission = false
+                    val action = pending
+                    val silent = pendingSilent
+                    pending = Pending.NONE
+                    permissionPending = false
                     if (dev == null || !granted) {
                         pendingFlash = null
-                        log("USB permission denied")
-                    } else if (odin) odinFlash(dev)
-                    else connect(dev)
+                        autoBlockedUntil = SystemClock.elapsedRealtime() + 60_000
+                        if (!silent) log("USB permission denied")
+                    } else when (action) {
+                        Pending.ADB -> connect(dev, silent)
+                        Pending.ODIN -> connectOdin(dev, silent)
+                        Pending.FLASH -> odinFlash(dev)
+                        Pending.NONE -> {}
+                    }
                 }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> controls.postDelayed({ autoConnect() }, 800)
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val d = deviceFrom(i)
-                    if (d == null || d.vendorId == 0x04E8) odinConn?.close()
+                    var dropped = false
+                    connecting?.close()
+                    if (d == null || d.vendorId == 0x04E8) {
+                        if (odinConn != null) dropped = true
+                        odinConn?.close()
+                        odinConn = null
+                        odinPit = null
+                    }
                     if (conn != null) {
                         conn?.close()
                         conn = null
-                        setStatus("Disconnected (device unplugged)")
+                        dropped = true
                     }
+                    if (dropped) setStatus("Disconnected (device unplugged)")
                 }
             }
         }
@@ -123,6 +146,7 @@ class MainActivity : ComponentActivity() {
         val filter = IntentFilter().apply {
             addAction(ACTION_PERMISSION)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
         }
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
@@ -130,7 +154,7 @@ class MainActivity : ComponentActivity() {
         findViewById<Button>(R.id.btnDisconnect).setOnClickListener { disconnect() }
         findViewById<Button>(R.id.btnBrowse).setOnClickListener {
             val c = conn
-            if (c == null || c.closed) log("Connect to the target device first")
+            if (c == null || c.closed) log(if (odinOpen()) "File browsing needs ADB mode – the device is in Download Mode" else "Connect to the target device first")
             else startActivity(Intent(this, FileBrowserActivity::class.java))
         }
         findViewById<Button>(R.id.btnRun).setOnClickListener { doShell() }
@@ -152,11 +176,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun statusLine(): String = when {
+        conn != null -> "Connected: ${AdbSession.model}"
+        odinOpen() -> "Connected: Download Mode"
+        else -> "Not connected"
+    }
+
     override fun onResume() {
         super.onResume()
         val c = conn
         if (c != null && c.closed) conn = null
-        if (!busy.get()) setStatus(if (conn != null) "Connected: ${AdbSession.model}" else "Not connected")
+        if (odinConn?.isOpen == false) odinConn = null
+        if (!busy.get()) setStatus(statusLine())
+        autoConnect()
     }
 
     override fun onDestroy() {
@@ -200,6 +232,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setEnabledRec(v: View, enabled: Boolean) {
+        if (v.id == R.id.btnDisconnect) return
         if (v is Button || v is CheckBox || v is EditText) v.isEnabled = enabled
         if (v is ViewGroup) for (i in 0 until v.childCount) setEnabledRec(v.getChildAt(i), enabled)
     }
@@ -231,7 +264,7 @@ class MainActivity : ComponentActivity() {
         if (b >= 1024 * 1024) "${b / (1024 * 1024)} MB" else "${b / 1024} KB"
 
     private fun runOp(name: String, block: (AdbConnection) -> Unit) {
-        val c = conn ?: run { log("Not connected"); return }
+        val c = conn ?: run { log(if (odinOpen()) "This needs ADB mode – the device is in Download Mode" else "Not connected"); return }
         if (!beginOp()) return
         exec.execute {
             try {
@@ -254,30 +287,54 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun findDownloadDevice(): UsbDevice? =
+        usbManager.deviceList.values.firstOrNull { odinInterface(it) != null }
+
+    private fun odinOpen(): Boolean = odinConn?.isOpen == true
+
     private fun onConnectClicked() {
-        if (conn != null) { log("Already connected"); return }
-        val dev = findAdbDevice()
-        if (dev == null) {
-            log("No ADB device found. Use a USB OTG cable, enable USB debugging (or boot to recovery / ADB sideload).")
+        if (conn != null || odinOpen()) { log("Already connected"); return }
+        val adb = findAdbDevice()
+        if (adb != null) {
+            if (usbManager.hasPermission(adb)) connect(adb, false) else requestUsbPermission(adb, Pending.ADB, false)
             return
         }
-        if (usbManager.hasPermission(dev)) {
-            connect(dev)
-        } else {
-            requestUsbPermission(dev)
+        val dl = findDownloadDevice()
+        if (dl != null) {
+            if (usbManager.hasPermission(dl)) connectOdin(dl, false) else requestUsbPermission(dl, Pending.ODIN, false)
+            return
         }
+        log("No ADB or Download Mode device found. Use a USB OTG cable, enable USB debugging, or boot the target into recovery / Download Mode.")
     }
 
-    private fun requestUsbPermission(dev: UsbDevice) {
+    private fun requestUsbPermission(dev: UsbDevice, action: Pending, silent: Boolean) {
+        pending = action
+        pendingSilent = silent
+        permissionPending = true
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or
             if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
         val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERMISSION).setPackage(packageName), flags)
         usbManager.requestPermission(dev, pi)
     }
 
-    private fun connect(dev: UsbDevice) {
+    /** Connects by itself when the app opens or a device is plugged in. Silent unless USB permission is needed. */
+    private fun autoConnect() {
+        if (busy.get() || permissionPending || conn != null || odinOpen()) return
+        if (SystemClock.elapsedRealtime() < autoBlockedUntil) return
+        val adb = findAdbDevice()
+        val dev = adb ?: findDownloadDevice() ?: return
+        val action = if (adb != null) Pending.ADB else Pending.ODIN
+        if (usbManager.hasPermission(dev)) {
+            if (adb != null) connect(dev, true) else connectOdin(dev, true)
+        } else {
+            requestUsbPermission(dev, action, true)
+        }
+    }
+
+    private fun connect(dev: UsbDevice, silent: Boolean) {
         if (!beginOp()) return
         setStatus("Connecting…")
+        ui { findViewById<Button>(R.id.btnDisconnect).isEnabled = true }
         exec.execute {
             var c: AdbConnection? = null
             try {
@@ -293,6 +350,7 @@ class MainActivity : ComponentActivity() {
                 if (!usb.claimInterface(iface, true)) { usb.close(); throw IOException("claimInterface failed") }
 
                 c = AdbConnection(usb, iface, eps.first, eps.second, AdbKeyStore.load(this))
+                connecting = c
                 c.onAuthPrompt = { setStatus("Tap “Allow” on the target device…") }
                 val banner = c.connect()
                 conn = c
@@ -303,14 +361,34 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 c?.close()
                 setStatus("Not connected")
-                log("✗ Connect failed: ${e.message}")
+                if (!silent) log("✗ Connect failed: ${reasonOf(e)}")
+                autoBlockedUntil = SystemClock.elapsedRealtime() + 20_000
             } finally {
+                connecting = null
                 endOp()
             }
         }
     }
 
     private fun disconnect() {
+        val pendingConnect = connecting
+        if (pendingConnect != null) {            // cancel a connect that is waiting for "Allow"
+            pendingConnect.close()
+            return
+        }
+        val o = odinConn
+        if (o != null) {
+            if (!beginOp()) return
+            exec.execute {
+                try { o.endSession(2000) } catch (_: Exception) {}
+                o.close()
+                odinConn = null
+                odinPit = null
+                endOp()
+                setStatus("Not connected")
+            }
+            return
+        }
         conn?.close()
         conn = null
         setStatus("Not connected")
@@ -527,23 +605,65 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    private fun openOdin(dev: UsbDevice): OdinConnection {
+        val iface = odinInterface(dev) ?: throw IOException("No Odin interface")
+        val eps = bulkEndpoints(iface) ?: throw IOException("Odin bulk endpoints not found")
+        var ctrl: UsbInterface? = null
+        for (n in 0 until dev.interfaceCount) {
+            val i = dev.getInterface(n)
+            if (i.interfaceClass == UsbConstants.USB_CLASS_COMM) { ctrl = i; break }
+        }
+        val usb = usbManager.openDevice(dev) ?: throw IOException("openDevice failed")
+        if (ctrl != null) usb.claimInterface(ctrl, true)
+        if (!usb.claimInterface(iface, true)) { usb.close(); throw IOException("claimInterface failed") }
+        usb.setInterface(iface)
+        return OdinConnection(usb, iface, ctrl, eps.first, eps.second)
+    }
+
+    /** Opens the Download Mode session (handshake, session, partition table) and keeps it for flashing. */
+    private fun connectOdin(dev: UsbDevice, silent: Boolean) {
+        if (!beginOp()) return
+        setStatus("Connecting…")
+        exec.execute {
+            var o: OdinConnection? = null
+            try {
+                o = openOdin(dev)
+                o.setupSerial()
+                o.handshake()
+                o.beginSession()
+                val pit = OdinConnection.parsePit(o.downloadPit())
+                odinConn = o
+                odinPit = pit
+                setStatus("Connected: Download Mode")
+                log("Connected: Download Mode")
+            } catch (e: Exception) {
+                o?.close()
+                setStatus("Not connected")
+                if (!silent) log("✗ Connect failed: ${reasonOf(e)}")
+                autoBlockedUntil = SystemClock.elapsedRealtime() + 20_000
+            } finally {
+                endOp()
+            }
+        }
+    }
+
     private fun startOdin(items: List<FlashItem>) {
-        val dev = usbManager.deviceList.values.firstOrNull { odinInterface(it) != null }
+        pendingFlash = items
+        if (odinOpen()) {
+            odinFlash(null)
+            return
+        }
+        val dev = findDownloadDevice()
         if (dev == null) {
+            pendingFlash = null
             log("❌ Error: Unable to flash, REASON : No Download Mode device found")
             log("USB devices seen: ${describeUsb()}")
             return
         }
-        pendingFlash = items
-        if (usbManager.hasPermission(dev)) {
-            odinFlash(dev)
-        } else {
-            waitingOdinPermission = true
-            requestUsbPermission(dev)
-        }
+        if (usbManager.hasPermission(dev)) odinFlash(dev) else requestUsbPermission(dev, Pending.FLASH, false)
     }
 
-    private fun odinFlash(dev: UsbDevice) {
+    private fun odinFlash(dev: UsbDevice?) {
         val items = pendingFlash ?: return
         pendingFlash = null
         if (!beginOp()) return
@@ -552,27 +672,24 @@ class MainActivity : ComponentActivity() {
             var odin: OdinConnection? = null
             var current: String? = null
             try {
-                val iface = odinInterface(dev) ?: throw IOException("No Odin interface")
-                val eps = bulkEndpoints(iface) ?: throw IOException("Odin bulk endpoints not found")
-                var ctrl: UsbInterface? = null
-                for (n in 0 until dev.interfaceCount) {
-                    val i = dev.getInterface(n)
-                    if (i.interfaceClass == UsbConstants.USB_CLASS_COMM) { ctrl = i; break }
+                val existing = odinConn
+                val savedPit = odinPit
+                val o: OdinConnection
+                val pit: List<PitEntry>
+                if (existing != null && existing.isOpen && savedPit != null) {
+                    o = existing
+                    pit = savedPit
+                } else {
+                    if (dev == null) throw IOException("Disconnected")
+                    o = openOdin(dev)
+                    odinConn = o
+                    o.setupSerial()
+                    o.handshake()
+                    o.beginSession()
+                    pit = OdinConnection.parsePit(o.downloadPit())
                 }
-
-                val usb = usbManager.openDevice(dev) ?: throw IOException("openDevice failed")
-                if (ctrl != null) usb.claimInterface(ctrl, true)
-                if (!usb.claimInterface(iface, true)) { usb.close(); throw IOException("claimInterface failed") }
-                usb.setInterface(iface)
-                val o = OdinConnection(usb, iface, ctrl, eps.first, eps.second)
                 odin = o
-                odinConn = o
-
                 setStatus("Download Mode: flashing…")
-                o.setupSerial()
-                o.handshake()
-                o.beginSession()
-                val pit = OdinConnection.parsePit(o.downloadPit())
 
                 // Map every file to a partition BEFORE writing anything.
                 val plan = ArrayList<PlanStep>()
@@ -635,6 +752,7 @@ class MainActivity : ComponentActivity() {
             } finally {
                 odin?.close()
                 odinConn = null
+                odinPit = null
                 endOp()
                 showProgress(0)
                 if (conn == null) setStatus("Not connected")
